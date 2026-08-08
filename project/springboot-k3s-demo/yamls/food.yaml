@@ -1,0 +1,110 @@
+
+---
+# Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: springboot
+  name: food
+  labels:
+    app: food
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: food
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: food
+      namespace: springboot
+    spec:
+      containers:
+        - name: food
+          image: ghcr.io/imzhoukunqiang/springboot-k3s-food:1.2.0
+          imagePullPolicy: Always
+          ports:
+            - name: tcp-8080
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: server.port
+              value: '80'
+#            - name: remote.foodUrl
+#              value: 'http://food-svc'
+            - name: remote.digitalUrl
+              value: 'http://digital-svc'
+          resources:
+            limits:
+              memory: '256Mi'
+              cpu: '1'
+          livenessProbe:
+            httpGet:
+              host: ''
+              path: /actuator/health/liveness
+              port: 80
+              scheme: HTTP
+          readinessProbe:
+            httpGet:
+              host: ''
+              path: /actuator/health/readiness
+              port: 80
+              scheme: HTTP
+          startupProbe:
+            failureThreshold: 30
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            httpGet:
+              host: ''
+              path: /actuator/health/readiness
+              port: 80
+              scheme: HTTP
+      securityContext: {}
+      affinity:  # 亲和性
+        nodeAffinity:  # 节点亲和性
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions: # 要求被调度的Pod所在的节点不能有 node-role.kubernetes.io/control-plane 标签
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: NotIn
+                    values:
+                      - 'true'
+        podAffinity: {}  # Pod亲和性
+        podAntiAffinity:  # Pod反亲和性
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - podAffinityTerm: # 将具有标签 app: food 的Pod分散在不同的节点上，
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - food
+                topologyKey: kubernetes.io/hostname
+              weight: 1
+
+---
+#Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: food-svc
+  annotations:
+    {}
+  labels:
+    {}
+  namespace: springboot
+spec:
+  selector:
+    app: food
+  ports:
+    - name: tcp-80
+      port: 80
+      protocol: TCP
+      targetPort: 80
+  sessionAffinity: None
+  type: ClusterIP

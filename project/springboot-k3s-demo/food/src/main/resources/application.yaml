@@ -1,0 +1,11 @@
+spring:
+  application:
+    name: Food
+
+server:
+  port: 8082
+  shutdown: "graceful"
+
+logging:
+  level:
+    "com.github.zhoukq": DEBUG

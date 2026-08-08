@@ -1,0 +1,11 @@
+spring:
+  application:
+    name: Digital
+
+server:
+  port: 8081
+  shutdown: "graceful"
+
+logging:
+  level:
+    "com.github.zhoukq": DEBUG

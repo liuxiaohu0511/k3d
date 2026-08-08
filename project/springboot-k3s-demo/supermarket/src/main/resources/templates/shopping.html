@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Shopping</title>
+    <style>
+        body {
+          display: flex;
+          flex-wrap: wrap;
+          align-content: center;
+          justify-content: center;
+        }
+
+        table,
+        th,
+        td {
+          border: 1px solid black;
+          border-collapse: collapse;
+          padding: 5px;
+        }
+    </style>
+</head>
+
+<body>
+<div>
+    <div th:each="productEntry : ${productMap}">
+        <h1 th:text="${productEntry.key}">Name</h1>
+        <table>
+            <thead>
+            <tr>
+                <th>商品名称</th>
+                <th>价格</th>
+                <th>库存数量</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr th:each="product : ${productEntry.value}">
+                <td th:text="${product.name}">商品名称</td>
+                <td th:text="${product.price}">价格</td>
+                <td th:text="${product.stock}">库存数量</td>
+            </tr>
+            </tbody>
+        </table>
+    </div>
+
+</div>
+</body>
+
+</html>

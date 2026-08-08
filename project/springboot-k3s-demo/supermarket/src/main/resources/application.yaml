@@ -1,0 +1,14 @@
+spring:
+  application:
+    name: Supermarket
+
+logging:
+  level:
+    "com.github.zhoukq": DEBUG
+server:
+  shutdown: "graceful"
+
+remote:
+  timeout: 1200
+  digitalUrl: http://localhost:8081
+  foodUrl: http://localhost:8082

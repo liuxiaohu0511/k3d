@@ -1,0 +1,130 @@
+
+---
+# Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: springboot  # 部署所属的命名空间
+  name: supermarket  # 部署的名称
+  labels:
+    app: supermarket  # 部署的标签
+spec:
+  replicas: 2  # 副本数量
+  selector:
+    matchLabels:
+      app: supermarket  # 选择器匹配标签
+  strategy:
+    rollingUpdate:  # 滚动更新策略
+      maxSurge: 25%  # 最大扩展数量
+      maxUnavailable: 25%  # 最大不可用数量
+    type: RollingUpdate  # 更新类型
+  template:
+    metadata:
+      labels:
+        app: supermarket  # Pod模板的标签
+      namespace: springboot  # Pod所属的命名空间
+    spec:
+      containers:
+        - name: supermarket  # 容器名称
+          image: ghcr.io/imzhoukunqiang/springboot-k3s-supermarket:1.2.0  # 镜像
+          imagePullPolicy: Always  # 镜像拉取策略
+          ports:
+            - name: tcp-8080  # 端口名称
+              containerPort: 8080  # 容器端口
+              protocol: TCP  # 网络协议
+          env:  # 环境变量
+            - name: server.port
+              value: '80'
+            - name: remote.foodUrl
+              value: 'http://food-svc'
+            - name: remote.digitalUrl
+              value: 'http://digital-svc'
+          resources:  # 资源限制
+            limits:
+              memory: '256Mi'  # 内存限制
+              cpu: '1'  # CPU限制
+          livenessProbe:  # 存活探针
+            httpGet:
+              host: ''  # 主机
+              path: /actuator/health/liveness  # 路径
+              port: 80  # 端口
+              scheme: HTTP  # 方案
+          readinessProbe:  # 就绪探针
+            httpGet:
+              host: ''  # 主机
+              path: /actuator/health/readiness  # 路径
+              port: 80  # 端口
+              scheme: HTTP  # 方案
+          startupProbe:  # 启动探针
+            failureThreshold: 30  # 失败阈值
+            initialDelaySeconds: 5  # 初始延迟时间
+            periodSeconds: 10  # 周期
+            httpGet:
+              host: ''  # 主机
+              path: /actuator/health/readiness  # 路径
+              port: 80  # 端口
+              scheme: HTTP  # 方案
+      securityContext: {}  # 安全上下文
+      affinity:  # 亲和性
+        nodeAffinity:  # 节点亲和性
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions: # 要求被调度的Pod所在的节点不能有 node-role.kubernetes.io/control-plane 标签
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: NotIn
+                    values:
+                      - 'true'
+        podAffinity: {}  # Pod亲和性
+        podAntiAffinity:  # Pod反亲和性
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - podAffinityTerm: # 将具有标签 app: supermarket 的Pod分散在不同的节点上，
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - supermarket
+                topologyKey: kubernetes.io/hostname
+              weight: 1
+
+---
+#Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: supermarket-svc  # 服务名称
+  annotations: {}  # 注解
+  labels: {}  # 标签
+  namespace: springboot  # 服务所属的命名空间
+spec:
+  selector:
+    app: supermarket  # 选择器匹配标签
+  ports:
+    - name: tcp-80  # 端口名称
+      port: 80  # 服务端口
+      protocol: TCP  # 网络协议
+      targetPort: 80  # 目标端口
+  sessionAffinity: None  # 会话亲和性
+  type: ClusterIP  # 服务类型
+
+---
+# Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  namespace: springboot  # 入口所属的命名空间
+  name: supermarket-ingress  # 入口名称
+  annotations: {}  # 注解
+  labels: {}  # 标签
+spec:
+  rules:
+    - host: supermarket-127-0-0-1.nip.io  # 主机名
+      http:
+        paths:
+          - pathType: Prefix  # 路径类型
+            path: "/"  # 路径
+            backend:
+              service:
+                port:
+                  number: 80  # 端口号
+                name: supermarket-svc  # 服务名称
