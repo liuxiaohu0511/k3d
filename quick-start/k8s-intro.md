@@ -1,160 +1,257 @@
-# k3d 集群内置资源类型（`kubectl api-resources` 输出，附说明）
+## 这里介绍下k8s常见的crd的一些定义和属性介绍
+### Deploment
+```yaml
+apiVersion: apps/v1        # API版本，Deployment固定用apps/v1
+kind: Deployment           # 资源类型：部署控制器，管理Pod的创建、更新、回滚
+metadata:
+  name: my-app-deployment  # Deployment的名字，集群内同namespace下唯一
+  namespace: default       # 部署到哪个命名空间，不写默认是default
+  labels:                  # 给Deployment本身打标签，用于筛选/管理，非必需但建议加
+    app: my-app
+    tier: backend
+spec:
+  replicas: 3               # 期望运行的Pod副本数量，控制器会自动维持这个数量
+  revisionHistoryLimit: 10  # 保留多少个历史版本(用于回滚)，默认10，可按需调整
+  strategy:                 # 滚动更新策略
+    type: RollingUpdate     # 更新方式：RollingUpdate(滚动更新，默认) 或 Recreate(先全删再建，会有服务中断)
+    rollingUpdate:
+      maxSurge: 1           # 更新过程中最多可以超出期望副本数多少个(1或百分比如"25%")
+      maxUnavailable: 0     # 更新过程中最多允许多少个Pod不可用(设0表示更新时始终保证全量可用)
+  selector:                 # 用来匹配哪些Pod归这个Deployment管，必须和下面template.metadata.labels一致
+    matchLabels:
+      app: my-app
+  template:                 # Pod模板，定义实际创建出来的Pod长什么样
+    metadata:
+      labels:                # Pod的标签，必须包含上面selector.matchLabels里的内容
+        app: my-app
+        tier: backend
+    spec:
+      restartPolicy: Always  # 容器退出后的重启策略：Always(总是重启，Deployment场景固定用这个)
+      terminationGracePeriodSeconds: 30  # Pod删除时，给容器多长时间优雅关闭(收到SIGTERM后)，超时才SIGKILL强杀
+      containers:
+        - name: my-app-container   # 容器名字，一个Pod可以有多个容器，这里是主容器
+          image: nginx:1.25        # 镜像名+版本号，务必锁定版本号，避免latest带来的不确定性
+          imagePullPolicy: IfNotPresent  # 镜像拉取策略：Always(每次都拉)/IfNotPresent(本地没有才拉)/Never(只用本地)
+          ports:
+            - containerPort: 80    # 容器内部监听的端口，仅做声明用途，不代表实际暴露
+              name: http           # 端口起个名字，方便Service引用
+              protocol: TCP        # 协议，TCP或UDP
+          env:                     # 环境变量
+            - name: ENV_NAME
+              value: "production"
+            - name: SECRET_KEY     # 从Secret中读取敏感信息，而不是明文写value
+              valueFrom:
+                secretKeyRef:
+                  name: my-secret
+                  key: secret-key
+          resources:               # 资源限制，非常重要，生产环境务必配置，避免单个Pod把节点资源吃光
+            requests:               # 请求资源：调度器依据这个决定Pod放到哪个节点，是"最低保证"
+              cpu: "250m"           # 250毫核，即0.25个CPU核心
+              memory: "256Mi"       # 256MB内存
+            limits:                 # 限制资源：容器能用到的资源上限，超过CPU会被限流，超过内存会被OOMKill
+              cpu: "500m"
+              memory: "512Mi"
+          livenessProbe:            # 存活探针：判断容器是否"活着"，失败会被kubelet重启容器
+            httpGet:
+              path: /healthz
+              port: 80
+            initialDelaySeconds: 10  # 容器启动后多久开始探测(给应用启动留时间)
+            periodSeconds: 10        # 探测间隔
+            timeoutSeconds: 3        # 单次探测超时时间
+            failureThreshold: 3      # 连续失败几次才判定为不健康
+          readinessProbe:            # 就绪探针：判断容器是否"准备好接流量"，失败会从Service的Endpoints里摘除
+            httpGet:
+              path: /ready
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          volumeMounts:              # 挂载卷到容器内的路径
+            - name: config-volume
+              mountPath: /etc/config
+              readOnly: true
+      volumes:                      # 定义Pod级别的存储卷，来源可以是ConfigMap/Secret/PVC等
+        - name: config-volume
+          configMap:
+            name: my-app-config
+      nodeSelector:                 # 简单的节点选择器，只调度到带有对应标签的节点上
+        disktype: ssd
+      affinity:                     # 更复杂的调度规则(亲和性/反亲和性)，比如让多个副本尽量分散到不同节点
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: my-app
+                topologyKey: kubernetes.io/hostname
+      tolerations:                  # 容忍节点的污点(Taint)，允许调度到有特定污点的节点上
+        - key: "special"
+          operator: "Equal"
+          value: "true"
+          effect: "NoSchedule"
+```
 
-## 核心组 `v1`（最基础，无需额外声明group）
+### Service
+```bash
+apiVersion: v1              # Service固定用v1
+kind: Service
+metadata:
+  name: my-app-svc          # Service名字，集群内DNS会自动生成 my-app-svc.default.svc.cluster.local
+  namespace: default
+  labels:
+    app: my-app
+spec:
+  type: ClusterIP            # Service类型，常见4种：
+                             # ClusterIP(默认，仅集群内可访问)
+                             # NodePort(在每个节点开一个固定端口，集群外可通过节点IP:端口访问)
+                             # LoadBalancer(云厂商提供的外部负载均衡器，本地k3d一般不直接支持，需配合MetalLB等)
+                             # ExternalName(把Service映射到外部DNS名，不做代理转发)
+  selector:                  # 通过标签选择器找到对应的Pod，必须和Deployment里Pod的labels一致
+    app: my-app
+  ports:
+    - name: http              # 端口名字，一个Service可以暴露多个端口时用来区分
+      protocol: TCP           # 协议
+      port: 80                # Service自己监听的端口(集群内其他服务通过这个端口访问)
+      targetPort: 80          # 转发到Pod容器内的哪个端口(可以填端口号，也可以填containerPort里定义的name如"http")
+      # nodePort: 30080       # 仅type为NodePort时需要，指定固定的节点端口(范围默认30000-32767)，不写会随机分配
+  sessionAffinity: None       # 会话保持策略：None(不保持，默认轮询) 或 ClientIP(同一客户端IP始终转发到同一个Pod)
+```
+### Ingress
+```bash
+apiVersion: networking.k8s.io/v1   # Ingress固定用这个版本(v1，老版本用extensions/v1beta1已废弃)
+kind: Ingress
+metadata:
+  name: my-app-ingress
+  namespace: default
+  annotations:                      # 注解，用来配置Ingress Controller的具体行为，不同Controller(Traefik/Nginx等)注解不通用
+    ingress.kubernetes.io/ssl-redirect: "false"   # 是否强制跳转https，本地测试环境一般关掉
+    # traefik.ingress.kubernetes.io/router.middlewares: default-my-middleware@kubernetescrd  # 引用Traefik中间件(如路径改写、限流等)
+    # nginx.ingress.kubernetes.io/rewrite-target: /  # 如果用的是Nginx Ingress Controller，这是常见的路径改写注解
+spec:
+  ingressClassName: traefik          # 指定用哪个Ingress Controller处理，k3d默认自带traefik；不写的话走集群默认IngressClass
+  tls:                                # 配置HTTPS证书(可选，没有HTTPS需求可以整段删掉)
+    - hosts:
+        - my-app.local
+      secretName: my-app-tls-secret  # 提前创建好的TLS证书Secret(kubectl create secret tls)
+  rules:                              # 路由规则，可以配置多条，按顺序匹配
+    - host: my-app.local              # 按域名区分，不写host则匹配所有域名(需要配合本地hosts文件解析或真实DNS)
+      http:
+        paths:
+          - path: /                   # 匹配的URL路径
+            pathType: Prefix          # 匹配方式：
+                                       # Prefix(前缀匹配，如"/api"会匹配"/api"和"/api/xxx")
+                                       # Exact(精确匹配，完全一致才行)
+                                       # ImplementationSpecific(交给具体Controller自行解释)
+            backend:
+              service:
+                name: my-app-svc      # 转发到哪个Service
+                port:
+                  number: 80          # Service暴露的端口号(也可以用name代替number，写Service里定义的端口名)
+```
 
-| NAME | SHORTNAMES | KIND | 说明 |
-|---|---|---|---|
-| bindings | | Binding | 把Pod绑定到具体Node，通常是调度器内部使用，不需要手动操作 |
-| componentstatuses | cs | ComponentStatus | 查看控制平面组件(如etcd、scheduler)的健康状态，较老的API，新版集群已弃用 |
-| configmaps | cm | ConfigMap | 存储非敏感的配置数据(键值对/文件)，可挂载给Pod当环境变量或配置文件 |
-| endpoints | ep | Endpoints | 记录Service背后实际的Pod IP+端口列表，一般由K8s自动维护，不手写 |
-| events | ev | Event | 集群内发生的各种事件记录(如Pod调度失败、镜像拉取失败等)，排错必看 |
-| limitranges | limits | LimitRange | 限制某个命名空间下Pod/容器的资源请求上下限，防止有人不写resources吃满资源 |
-| namespaces | ns | Namespace | 逻辑隔离空间，把集群资源分组管理(如default、kube-system) |
-| nodes | no | Node | 集群里的工作节点，你之前用`kubectl get node`查看过 |
-| persistentvolumeclaims | pvc | PersistentVolumeClaim | Pod对存储的"申请单"，声明需要多大空间、什么访问模式 |
-| persistentvolumes | pv | PersistentVolume | 集群级别的实际存储资源，PVC会绑定到某个PV上 |
-| pods | po | Pod | 最小调度单位，一个或多个容器共享网络和存储 |
-| podtemplates | | PodTemplate | 预定义的Pod模板，供其他控制器复用，直接用的场景较少 |
-| replicationcontrollers | rc | ReplicationController | 老版本的副本控制器，功能被Deployment取代，新项目不建议用 |
-| resourcequotas | quota | ResourceQuota | 限制整个命名空间总共能用多少CPU/内存/Pod数量等 |
-| secrets | | Secret | 存储敏感信息(密码、token、证书)，内容会base64编码(注意不是加密) |
-| serviceaccounts | sa | ServiceAccount | Pod运行时的身份账号，配合RBAC控制Pod能访问哪些API |
-| services | svc | Service | 你已用到，给一组Pod提供固定访问入口+负载均衡 |
+### 三者的关系是
+```bash
+浏览器请求
+   ↓
+Ingress（按域名/路径路由，入口网关）
+   ↓
+Service（固定虚拟IP+DNS名，负载均衡到Pod）
+   ↓
+Pod（Deployment管理的实际运行实例，会不断创建/销毁/重建）
+```
+# 还有哪些CRD
+CRD（Custom Resource Definition，自定义资源定义）是 Kubernetes 的扩展机制，允许第三方给集群"发明"新的资源类型。结合你之前踩的 Traefik CRD 的坑，这里按**使用场景**分类，整理一份常见 CRD 清单。
 
-## 准入控制 `admissionregistration.k8s.io/v1`
+## 1. Ingress Controller 相关
 
-| NAME | KIND | 说明 |
-|---|---|---|
-| mutatingwebhookconfigurations | MutatingWebhookConfiguration | 资源创建/更新时，先经过webhook自动"修改"内容(如自动注入sidecar容器) |
-| validatingwebhookconfigurations | ValidatingWebhookConfiguration | 资源创建/更新时，先经过webhook"校验"是否合规，不合规就拒绝 |
+**Traefik**（k3d/k3s 默认自带）
+- `IngressRoute` — Traefik 自己的路由资源，比标准 Ingress 更灵活（支持更复杂的匹配规则）
+- `Middleware` — 你之前想用的路径改写、限流、认证等中间件
+- `TLSOption` / `TLSStore` — TLS 相关配置
 
-## API 扩展
+**Nginx Ingress Controller**
+- 主要靠 annotation 而非 CRD，CRD 用得较少
 
-| NAME | SHORTNAMES | KIND | 说明 |
-|---|---|---|---|
-| customresourcedefinitions | crd, crds | CustomResourceDefinition | 定义新资源类型本身，就是上一个问题讲的CRD |
-| apiservices | | APIService | 把额外的API组注册到kube-apiserver里，用于聚合API(如metrics-server) |
+## 2. 服务网格（Service Mesh）
 
-## 应用管理 `apps/v1`（最常打交道的一组）
+**Istio**
+- `VirtualService` — 流量路由规则（灰度发布、A/B测试常用）
+- `DestinationRule` — 定义流量策略（负载均衡算法、熔断等）
+- `Gateway` — 网格入口网关配置
+- `PeerAuthentication` / `AuthorizationPolicy` — mTLS 和访问控制
 
-| NAME | SHORTNAMES | KIND | 说明 |
-|---|---|---|---|
-| controllerrevisions | | ControllerRevision | 记录StatefulSet/DaemonSet的历史版本，用于回滚，一般不直接操作 |
-| daemonsets | ds | DaemonSet | 保证每个(或部分)节点都跑一个Pod副本，常用于日志采集/监控agent |
-| deployments | deploy | Deployment | 你已用到，管理无状态应用，支持滚动更新和回滚 |
-| replicasets | rs | ReplicaSet | Deployment底层实际管理Pod数量的对象，一般不直接操作它 |
-| statefulsets | sts | StatefulSet | 管理有状态应用(数据库等)，提供稳定的Pod名字、网络标识和独立存储 |
+**Linkerd**
+- `ServiceProfile` — 定义服务的路由和重试策略
 
-## 认证与授权
+## 3. 证书管理
 
-| NAME | KIND | 说明 |
-|---|---|---|
-| tokenreviews | TokenReview | 校验一个token是否有效，通常是API内部调用，不手动创建 |
-| localsubjectaccessreviews | LocalSubjectAccessReview | 检查某用户在指定命名空间是否有权限做某操作 |
-| selfsubjectaccessreviews | SelfSubjectAccessReview | 检查"我自己"是否有权限做某操作，常用于调试RBAC配置 |
-| selfsubjectrulesreviews | SelfSubjectRulesReview | 查询"我自己"在某命名空间下具体拥有哪些权限规则 |
-| subjectaccessreviews | SubjectAccessReview | 检查某用户/组是否有权限做某操作，全局版本 |
+**cert-manager**（最常用，几乎是标配）
+- `Certificate` — 声明需要的证书
+- `Issuer` / `ClusterIssuer` — 证书签发者（如 Let's Encrypt）
+- `CertificateRequest` — 证书请求记录
 
-## 自动扩缩容 / 任务调度
+## 4. 监控告警
 
-| NAME | SHORTNAMES | KIND | 说明 |
-|---|---|---|---|
-| horizontalpodautoscalers | hpa | HorizontalPodAutoscaler | 根据CPU/内存/自定义指标，自动增减Deployment的Pod副本数 |
-| cronjobs | cj | CronJob | 定时任务，语法类似Linux crontab，比如每天凌晨跑一次备份脚本 |
-| jobs | | Job | 一次性任务，跑完即结束，适合数据迁移、批处理场景 |
+**Prometheus Operator**
+- `ServiceMonitor` — 声明式定义要监控哪些 Service
+- `PodMonitor` — 类似，针对 Pod
+- `PrometheusRule` — 告警规则和记录规则
+- `Prometheus` / `Alertmanager` — 定义 Prometheus/Alertmanager 实例本身
 
-## 证书 / 协调 / 服务发现
+## 5. GitOps / 持续部署
 
-| NAME | SHORTNAMES | KIND | 说明 |
-|---|---|---|---|
-| certificatesigningrequests | csr | CertificateSigningRequest | 证书签名请求，常用于给节点或用户签发集群内部TLS证书 |
-| leases | Lease | 分布式锁/租约机制，用于组件选主(如多副本controller-manager选leader) |
-| endpointslices | EndpointSlice | Endpoints的升级版，大规模集群下性能更好，功能上等同于Endpoints |
-| events | ev | Event(新版) | 和核心组的Event功能一样，属于新API分组，逐步替代旧版 |
+**ArgoCD**
+- `Application` — 定义一个要同步的应用（关联 Git 仓库和目标集群）
+- `AppProject` — 应用分组和权限管理
 
-## 流控
+**Flux**
+- `GitRepository` / `HelmRepository` — 声明数据源
+- `Kustomization` / `HelmRelease` — 声明部署内容
 
-| NAME | KIND | 说明 |
-|---|---|---|
-| flowschemas | FlowSchema | 定义API请求如何被分类和限流，控制平面稳定性相关，一般不需要手动配置 |
-| prioritylevelconfigurations | PriorityLevelConfiguration | 配合FlowSchema，定义不同优先级请求的并发处理能力 |
+## 6. 存储相关
 
-## k3s / Helm 专属（**这组是k3d/k3s特有的，标准K8s没有**）
+**Rook / Ceph**
+- `CephCluster`、`CephBlockPool` 等 — 声明式管理 Ceph 存储集群
 
-| NAME | KIND | 说明 |
-|---|---|---|
-| helmchartconfigs | HelmChartConfig | 给k3s内置的Helm Chart(如Traefik)提供自定义配置覆盖 |
-| helmcharts | HelmChart | k3s内置的声明式Helm部署方式，写个YAML就能自动装Helm Chart |
-| addons | Addon | k3s自带组件的声明式管理(如CoreDNS、Traefik等的自动安装) |
+**Longhorn**（k3s 生态常见，Rancher 出品）
+- `Volume`、`Engine`、`Replica` 等 — 分布式块存储管理
 
-> 💡 这就是为什么你的 k3d 集群"自带" Traefik——它是通过 `HelmChart`/`Addon` 这套 k3s 专属机制自动安装的，标准 kubeadm 搭建的集群不会有这些资源类型。
+## 7. 数据库 Operator
 
-## 监控指标
+- **Postgres**: `PostgresCluster`（CrunchyData）、`Cluster`（CloudNativePG）
+- **MySQL**: `MySQLCluster`（各家 Operator 实现不同）
+- **Redis**: `RedisCluster` / `RedisFailover`（Redis Operator）
+- **MongoDB**: `MongoDBCommunity` / `MongoDB`（MongoDB Community/Enterprise Operator）
 
-| NAME | KIND | 说明 |
-|---|---|---|
-| nodes | NodeMetrics | 节点的实时CPU/内存使用量，`kubectl top node`背后用的就是这个 |
-| pods | PodMetrics | Pod的实时CPU/内存使用量，`kubectl top pod`背后用的就是这个，需要装metrics-server |
+> 这类数据库 Operator 挺适合你——比起手写 Deployment 部署 Redis（像你前面那样），用 Operator 可以自动处理主从、故障转移、备份这些运维细节。
 
-## 网络 `networking.k8s.io/v1`
+## 8. 网络策略增强
 
-| NAME | SHORTNAMES | KIND | 说明 |
-|---|---|---|---|
-| ingressclasses | | IngressClass | 声明集群里有哪些Ingress Controller可用(如traefik、nginx) |
-| ingresses | ing | Ingress | 你已用到，HTTP(S)路由规则的标准资源 |
-| networkpolicies | netpol | NetworkPolicy | 类似防火墙规则，控制Pod之间/Pod与外部的网络访问权限 |
+**Calico**
+- `NetworkPolicy`（增强版）、`GlobalNetworkPolicy`、`IPPool` 等
 
-## 节点 / 调度 / 中断预算
-
-| NAME | SHORTNAMES | KIND | 说明 |
-|---|---|---|---|
-| runtimeclasses | RuntimeClass | 指定Pod使用哪种容器运行时(如runc、kata)，一般用默认的即可 |
-| poddisruptionbudgets | pdb | PodDisruptionBudget | 限制维护/驱逐节点时最多能同时停掉多少Pod，保障服务不中断 |
-| priorityclasses | pc | PriorityClass | 定义Pod调度优先级，资源紧张时优先保证高优先级Pod运行 |
-
-## 权限控制 `rbac.authorization.k8s.io/v1`
-
-| NAME | KIND | 说明 |
-|---|---|---|
-| clusterrolebindings | ClusterRoleBinding | 把ClusterRole权限绑定给用户/组/ServiceAccount，作用于整个集群 |
-| clusterroles | ClusterRole | 定义集群级别的权限规则集合(可跨命名空间) |
-| rolebindings | RoleBinding | 把Role权限绑定给用户/组/ServiceAccount，作用于单个命名空间 |
-| roles | Role | 定义命名空间级别的权限规则集合 |
-
-## 存储 `storage.k8s.io/v1`
-
-| NAME | SHORTNAMES | KIND | 说明 |
-|---|---|---|---|
-| csidrivers | CSIDriver | 声明集群里安装了哪些CSI存储驱动(如AWS EBS、Ceph等) |
-| csinodes | CSINode | 记录每个节点支持哪些CSI驱动，K8s内部使用 |
-| csistoragecapacities | CSIStorageCapacity | CSI驱动上报的存储容量信息，用于调度决策 |
-| storageclasses | sc | StorageClass | 动态存储供应的模板，声明"创建PVC时该用哪种存储" |
-| volumeattachments | VolumeAttachment | 记录卷挂载到节点的状态，K8s内部使用，不手动创建 |
-
-## Traefik CRD（`traefik.containo.us/v1alpha1`）
-
-> 🎯 之前 `Middleware` 报错的答案就在这——你集群实际的 apiVersion 是 `traefik.containo.us/v1alpha1`，对应 Traefik v2.x，不是较新的 `traefik.io/v1alpha1`。
-
-| NAME | KIND | 说明 |
-|---|---|---|
-| ingressroutes | IngressRoute | Traefik自己的路由资源，比标准Ingress更灵活(支持更复杂匹配规则/中间件链) |
-| ingressroutetcps | IngressRouteTCP | 针对TCP协议(非HTTP)的路由规则，比如给Redis做四层转发 |
-| ingressrouteudps | IngressRouteUDP | 针对UDP协议的路由规则 |
-| middlewares | Middleware | 你之前想用的中间件资源，支持路径改写(StripPrefix)、限流、认证、重试等 |
-| middlewaretcps | MiddlewareTCP | TCP层的中间件(功能比HTTP中间件少很多) |
-| serverstransports | ServersTransport | 配置Traefik到后端服务的连接细节(如TLS校验、超时时间) |
-| tlsoptions | TLSOption | 自定义TLS协议版本、加密套件等安全参数 |
-| tlsstores | TLSStore | 配置默认TLS证书存储位置 |
-| traefikservices | TraefikService | Traefik增强版的Service抽象，支持加权轮询、镜像流量等高级负载均衡策略 |
+**Cilium**
+- `CiliumNetworkPolicy`、`CiliumEndpoint` 等
 
 ---
 
-## 结合你实践路径的建议
+## 怎么查看你集群里实际装了哪些 CRD
 
-对照你目前踩过的坑和用过的资源，接下来比较有价值的学习方向：
+```bash
+kubectl get crd
+```
 
-1. **`ConfigMap`/`Secret`** — 你的 Tomcat/Nginx 部署目前配置都是硬编码在镜像里的，可以试着外部化
-2. **`PersistentVolumeClaim`** — 你的 Redis 现在重启就丢数据，加个PVC能解决
-3. **`NetworkPolicy`** — 体验一下限制 Redis 只能被 Tomcat/Nginx 访问，其他 Pod 访问不了，更贴近生产安全实践
-4. **`IngressRoute`**（Traefik专属）— 既然你已经在纠结 `Middleware` 怎么配了，不如直接用 `IngressRoute` 替代标准 `Ingress`，原生支持中间件链，配置起来比"Ingress+annotation+Middleware"这种绕弯的方式更直观
+看某个具体 CRD 的详细字段说明（类似 `kubectl explain`）：
+```bash
+kubectl explain middleware.traefik.io
+```
+
+看某个分组下有哪些 CRD：
+```bash
+kubectl get crd | grep traefik
+kubectl get crd | grep cert-manager
+```
+
+---
+
+**结合你目前的实践**：你已经在 k3d 里用了 Deployment/Service/Ingress 这些内置资源，如果接下来想更进一步，比较自然的下一步是装 **cert-manager**（本地测试可以用自签证书体验 HTTPS 流程）或者试试 **Prometheus Operator**（监控你现在部署的 Tomcat/Redis/Nginx），这两个在实际生产环境里也是高频出现的组件，练习价值比较高。
