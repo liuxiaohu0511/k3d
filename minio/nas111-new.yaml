@@ -1,0 +1,145 @@
+# juicefs-nfs-gateway.yaml
+#
+# 依赖：已经跑过 setup-juicefs-csi-test.sh up，即：
+#   - kube-system/juicefs-secret 已存在（name/metaurl/storage/bucket/access-key/secret-key）
+#   - storage-test 命名空间下 MinIO(minio) 和 Redis(redis-master) 已就绪
+#
+# 部署在 kube-system，是为了能直接引用已有的 juicefs-secret（Secret 是命名空间级资源，
+# 跨命名空间不能直接引用）。如果你想部署到别的命名空间，把 juicefs-secret 复制过去即可：
+#   kubectl get secret juicefs-secret -n kube-system -o yaml | \
+#     sed 's/namespace: kube-system/namespace: <目标ns>/' | kubectl apply -f -
+#
+# nfs-ganesha 容器用的是 janeczku/nfs-ganesha 镜像，通过环境变量配置导出行为，
+# 不需要自己写 ganesha.conf。
+apiVersion: v1
+kind: Pod
+metadata:
+  name: juicefs-nfs-gateway
+  namespace: kube-system
+  labels:
+    app: juicefs-nfs-gateway
+spec:
+  # JuiceFS mount 和 nfs-ganesha 需要共享同一个挂载点，
+  # emptyDir + Bidirectional 传播是关键，缺了这个第二个容器看不到挂载内容
+  volumes:
+    - name: jfs-mount
+      emptyDir: {}
+  containers:
+    # 容器一：负责把 JuiceFS 挂载到本地路径 /jfs
+    - name: juicefs-mount
+      image: docker.m.daocloud.io/juicedata/mount:ce-v1.2.0
+      securityContext:
+        privileged: true
+      env:
+        # 直接复用已有 juicefs-secret 的字段，避免重复写死凭据
+        - name: JFS_NAME
+          valueFrom:
+            secretKeyRef:
+              name: juicefs-secret
+              key: name
+        - name: JFS_METAURL
+          valueFrom:
+            secretKeyRef:
+              name: juicefs-secret
+              key: metaurl
+        - name: JFS_STORAGE
+          valueFrom:
+            secretKeyRef:
+              name: juicefs-secret
+              key: storage
+        - name: JFS_BUCKET
+          valueFrom:
+            secretKeyRef:
+              name: juicefs-secret
+              key: bucket
+        - name: JFS_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: juicefs-secret
+              key: access-key
+        - name: JFS_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: juicefs-secret
+              key: secret-key
+      command:
+        - sh
+        - -c
+        - |
+          set -e
+          echo "初始化 JuiceFS 文件系统（若已存在会直接跳过/更新元数据）: ${JFS_NAME}"
+          juicefs format \
+            --storage "${JFS_STORAGE}" \
+            --bucket "${JFS_BUCKET}" \
+            --access-key "${JFS_ACCESS_KEY}" \
+            --secret-key "${JFS_SECRET_KEY}" \
+            "${JFS_METAURL}" "${JFS_NAME}"
+
+          echo "挂载 JuiceFS 文件系统: ${JFS_NAME}"
+          juicefs mount "${JFS_METAURL}" /jfs \
+            -o allow_other -d
+          echo "挂载完成，保持容器存活"
+          tail -f /dev/null
+      volumeMounts:
+        - name: jfs-mount
+          mountPath: /jfs
+          mountPropagation: Bidirectional
+
+    # 容器二：nfs-ganesha，把 /jfs 目录导出成标准 NFS 服务
+    # 镜像通过环境变量生成 ganesha.conf，不需要自己写配置文件
+    - name: nfs-ganesha
+      image: docker.m.daocloud.io/janeczku/nfs-ganesha:latest
+      securityContext:
+        privileged: true
+        capabilities:
+          add: ["SYS_ADMIN", "DAC_READ_SEARCH", "SYS_RESOURCE"]
+      env:
+        - name: EXPORT_PATH
+          value: "/jfs"          # 容器内被导出的实际路径
+        - name: PSEUDO_PATH
+          value: "/jfs"          # NFSv4 客户端看到的路径
+        - name: EXPORT_ID
+          value: "1"
+        - name: PROTOCOLS
+          value: "3,4"
+        - name: SQUASH_MODE
+          value: "No_Root_Squash"
+        - name: LOG_LEVEL
+          value: "NIV_EVENT"
+      # 不覆盖镜像自带的启动命令（未验证过内部 entrypoint 脚本路径，避免猜测出错）。
+      # 依赖 mountPropagation: HostToContainer 让本容器能实时感知到
+      # juicefs-mount 容器后续才完成的 FUSE 挂载，不需要手动等待。
+      # 如果发现 ganesha 启动时导出的是空目录、后续 JuiceFS 挂载后客户端看不到内容，
+      # 说明该镜像内部可能又对 /data/nfs 做了一次 bind mount 导致传播链路断开，
+      # 到时候需要改用 initContainer 或换成 nfs-ganesha 官方镜像自建 Dockerfile。
+      volumeMounts:
+        - name: jfs-mount
+          mountPath: /jfs
+          mountPropagation: HostToContainer
+      ports:
+        - containerPort: 2049
+          name: nfs
+        - containerPort: 111
+          name: portmapper
+      readinessProbe:
+        tcpSocket:
+          port: 2049
+        initialDelaySeconds: 10
+        periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: juicefs-nfs-gateway
+  namespace: kube-system
+spec:
+  selector:
+    app: juicefs-nfs-gateway
+  ports:
+    - port: 2049
+      targetPort: 2049
+      name: nfs
+    - port: 111
+      targetPort: 111
+      name: portmapper
+  type: ClusterIP

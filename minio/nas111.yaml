@@ -1,0 +1,116 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: juicefs-nfs-gateway
+  namespace: kube-system
+  labels:
+    app: juicefs-nfs-gateway
+spec:
+  volumes:
+    - name: jfs-mount
+      emptyDir: {}
+  containers:
+    - name: juicefs-mount
+      image: docker.m.daocloud.io/juicedata/mount:ce-v1.2.0
+      securityContext:
+        privileged: true
+      env:
+        - name: JFS_NAME
+          valueFrom:
+            secretKeyRef:
+              name: juicefs-secret
+              key: name
+        - name: JFS_METAURL
+          valueFrom:
+            secretKeyRef:
+              name: juicefs-secret
+              key: metaurl
+        - name: JFS_STORAGE
+          valueFrom:
+            secretKeyRef:
+              name: juicefs-secret
+              key: storage
+        - name: JFS_BUCKET
+          valueFrom:
+            secretKeyRef:
+              name: juicefs-secret
+              key: bucket
+        - name: JFS_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: juicefs-secret
+              key: access-key
+        - name: JFS_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: juicefs-secret
+              key: secret-key
+      command:
+        - sh
+        - -c
+        - |
+          set -e
+          echo "挂载 JuiceFS 文件系统: ${JFS_NAME}"
+          juicefs mount "${JFS_METAURL}" /jfs \
+            --storage "${JFS_STORAGE}" \
+            --bucket "${JFS_BUCKET}" \
+            --access-key "${JFS_ACCESS_KEY}" \
+            --secret-key "${JFS_SECRET_KEY}" \
+            -o allow_other -d
+          echo "挂载完成，保持容器存活"
+          tail -f /dev/null
+      volumeMounts:
+        - name: jfs-mount
+          mountPath: /jfs
+          mountPropagation: Bidirectional
+
+    - name: nfs-ganesha
+      image: docker.m.daocloud.io/janeczku/nfs-ganesha:latest
+      securityContext:
+        privileged: true
+        capabilities:
+          add: ["SYS_ADMIN", "DAC_READ_SEARCH", "SYS_RESOURCE"]
+      env:
+        - name: EXPORT_PATH
+          value: "/jfs"
+        - name: PSEUDO_PATH
+          value: "/jfs"
+        - name: EXPORT_ID
+          value: "1"
+        - name: PROTOCOLS
+          value: "3,4"
+        - name: SQUASH_MODE
+          value: "No_Root_Squash"
+        - name: LOG_LEVEL
+          value: "NIV_EVENT"
+      volumeMounts:
+        - name: jfs-mount
+          mountPath: /jfs
+          mountPropagation: HostToContainer
+      ports:
+        - containerPort: 2049
+          name: nfs
+        - containerPort: 111
+          name: portmapper
+      readinessProbe:
+        tcpSocket:
+          port: 2049
+        initialDelaySeconds: 10
+        periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: juicefs-nfs-gateway
+  namespace: kube-system
+spec:
+  selector:
+    app: juicefs-nfs-gateway
+  ports:
+    - port: 2049
+      targetPort: 2049
+      name: nfs
+    - port: 111
+      targetPort: 111
+      name: portmapper
+  type: ClusterIP
