@@ -1,0 +1,26 @@
+[Unit]
+Description=jfs-router: prefix-based routing FUSE mount over multiple JuiceFS instances
+# 确保各个 juicefs 实例已经挂载完成后再启动本服务。
+# 如果各 backend 是通过独立的 systemd unit（如 juicefs mount 的 mount unit）
+# 管理的，把它们的 unit 名加到 After/Requires 里，例如：
+# After=mnt-.jfs\x2dtenantA.mount mnt-.jfs\x2dtenantB.mount
+# Requires=mnt-.jfs\x2dtenantA.mount mnt-.jfs\x2dtenantB.mount
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/jfs-router -config /etc/jfs-router/config.json
+ExecStop=/bin/fusermount -u /data
+Restart=on-failure
+RestartSec=2s
+
+# 挂载 FUSE 通常需要 root，或者给二进制 CAP_SYS_ADMIN；
+# 如果需要 allow_other，还需确保 /etc/fuse.conf 中启用了 user_allow_other。
+User=root
+
+# 卸载有残留引用时可能短暂失败，交给 ExecStop + Restart 逻辑处理，
+# 避免 systemd 因为 stop 超时直接 kill -9 导致挂载点变成"僵尸挂载"。
+TimeoutStopSec=15s
+
+[Install]
+WantedBy=multi-user.target

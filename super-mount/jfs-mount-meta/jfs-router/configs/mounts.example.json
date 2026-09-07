@@ -1,0 +1,6 @@
+{
+  "mounts": [
+    { "prefix": "/tenantA", "backend": "/mnt/.jfs-tenantA" },
+    { "prefix": "/tenantB", "backend": "/mnt/.jfs-tenantB" }
+  ]
+}

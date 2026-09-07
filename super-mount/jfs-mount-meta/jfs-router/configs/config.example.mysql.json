@@ -1,0 +1,27 @@
+{
+  "mountpoint": "/data",
+  "fs_name": "jfs-router",
+  "allow_other": true,
+
+  "entry_timeout_ms": 1000,
+  "attr_timeout_ms": 1000,
+
+  "cache": {
+    "capacity": 4096,
+    "ttl_seconds": 30,
+    "negative_ttl_seconds": 5,
+    "list_ttl_seconds": 30
+  },
+
+  "metastore": {
+    "type": "mysql",
+    "mysql": {
+      "dsn": "jfsrouter:CHANGE_ME@tcp(127.0.0.1:3306)/jfsrouter?parseTime=true",
+      "table": "mount_routes",
+      "segment_column": "segment",
+      "backend_column": "backend",
+      "max_open_conns": 4,
+      "max_idle_conns": 2
+    }
+  }
+}

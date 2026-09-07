@@ -1,0 +1,25 @@
+{
+  "mountpoint": "/data",
+  "fs_name": "jfs-router",
+  "allow_other": true,
+
+  "entry_timeout_ms": 1000,
+  "attr_timeout_ms": 1000,
+
+  "cache": {
+    "capacity": 4096,
+    "ttl_seconds": 30,
+    "negative_ttl_seconds": 5,
+    "list_ttl_seconds": 30
+  },
+
+  "metastore": {
+    "type": "redis",
+    "redis": {
+      "addr": "127.0.0.1:6379",
+      "password": "",
+      "db": 0,
+      "key": "jfs-router:mounts"
+    }
+  }
+}

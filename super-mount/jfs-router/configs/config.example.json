@@ -1,0 +1,11 @@
+{
+  "mountpoint": "/data",
+  "fs_name": "jfs-router",
+  "allow_other": true,
+  "debug": false,
+  "mounts": [
+    { "prefix": "/tenantA", "backend": "/mnt/.jfs-tenantA" },
+    { "prefix": "/tenantB", "backend": "/mnt/.jfs-tenantB" },
+    { "prefix": "/shared/logs", "backend": "/mnt/.jfs-logs" }
+  ]
+}
