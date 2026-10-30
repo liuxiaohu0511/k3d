@@ -161,3 +161,46 @@ The test ran under sh instead of bash, so the shell never sourced the script. I'
 - **节点重启期间指标会暂时消失**：因为 Pod 随主机一起下线，所以“指标过期”类告警不会误报。
 - **旧版本升级**：如果之前已经部署了 v1，滚动更新到 v2 时，已有节点的 label、annotation 和已知 GPU 清单会沿用，不需要清理。
 
+**长期、规模化的生产使用，Go 版更好；节点不多、想快速上线或自己能维护脚本，shell 版够用。**
+
+## 对比
+
+| 维度 | Shell 版 | Go 版 |
+|---|---|---|
+| 上线速度 | 已经写好，改一行脚本就能调 | 需要重写，约 1 到 2 天加联调 |
+| GPU 检测 | 解析 `nvidia-smi` 文本输出和 `dmesg`，容易受驱动版本和输出格式影响 | 用 NVML（go-nvml）直接读 ECC、重映射、掉卡状态，还能订阅 Xid 事件，不用 grep 内核日志 |
+| 排水 | 调用 `kubectl drain` 子进程，再用 jq 解析结果 | 直接用 `k8s.io/kubectl/pkg/drain` 或 Eviction API，错误处理更精细 |
+| 并发控制 | 靠数 label，多个节点同时故障时有小概率竞态 | 用 Lease 做分布式锁，可以彻底避免 |
+| 指标 | 手写文本，用 socat 起 HTTP 服务 | 官方 `client_golang`，直方图、标签基数都更规范 |
+| 测试 | 只能 mock 命令，我这次的测试就是这样做的 | 可以写真正的单元测试，用 `fake clientset` 跑完整状态机 |
+| 镜像与依赖 | alpine 加 bash、jq、curl、openssl、socat、kubectl，约 100MB | 单个静态二进制，用 distroless 约 20MB，没有 shell 依赖 |
+| 排查与维护 | 脚本超过 500 行后，引号、`set -u`、子 shell 变量作用域容易出隐蔽 bug | 类型安全，编译期就能发现不少问题 |
+| 改动门槛 | 运维同学直接改 ConfigMap 就行 | 需要懂 Go，并且要走构建发布流程 |
+
+## 两个版本都绕不开的地方
+
+- **重启宿主机**：不管用哪种语言，都要进入宿主机命名空间（nsenter 或 chroot）执行 `systemctl reboot`，这块没有更干净的办法。
+- **需要特权**：都需要 `privileged` 和 `hostPID`。
+- **NVML 的依赖**：Go 版用 NVML 时，容器里要能找到宿主机的 `libnvidia-ml.so`，要么挂载宿主机库，要么走 nvidia 容器运行时。这比 shell 版“nsenter 到宿主机跑 `nvidia-smi`”多一步配置。
+
+## 我的建议
+
+- **继续用 shell 版**：GPU 节点在几十台以内，团队熟悉 shell，想先把自动化跑起来。可以先在测试节点验证，再逐步扩大。
+- **换 Go 版**：节点规模上百，或者这个组件要长期维护、多人协作，又或者想把“检测”做得更准，比如实时订阅 Xid 而不是轮询 `dmesg`。
+
+可以分两步走：先用 shell 版上线并积累真实故障数据，知道哪些检测项最有用之后，再用 Go 重写。重写时我会把现在的状态机（healthy、draining、rebooting、recovering、failed）和 annotation 约定原样保留，这样升级时节点上的状态也能直接接上。
+
+如果你想直接上 Go 版，我可以帮你写，用 client-go、go-nvml、client_golang，附带单元测试和 Dockerfile。需要的话告诉我，NVML 库你们是打算通过 nvidia 运行时注入，还是从宿主机挂载？
+
+
+先确认沙箱里能不能装 Go、能不能拉到依赖，这决定我能验证到什么程度。
+
+`go-nvml` 能直连拉到。接着取 client-go 的 `go.mod`，确定哪些非 GitHub 路径的依赖需要 replace。
+
+依赖清单搞清楚了。我把非 GitHub 路径的模块用本地浅克隆做 `replace`，只用于沙箱验证，不影响交付的 `go.mod`。先后台克隆这些仓库。
+
+22 个仓库全部克隆成功。现在用探针程序验证 `client-go fake`、`go-nvml` 和 `prometheus` 能否一起编译。
+
+缺 `gopkg.in/check.v1`，补上本地替换后继续迭代。
+
+`sed` 把 require 块的右括号也改了。重新生成 `sandbox.mod`。
