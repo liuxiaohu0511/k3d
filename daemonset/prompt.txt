@@ -1,0 +1,163 @@
+我想做一个k8s的daemonset，主要功能如下：
+
+定时检查nvdia的卡的情况
+如果有卡损坏记录卡号和详细故障
+设置改节点不可调度，pod排水，等排空以后关闭主机
+重启完毕以后再次检查，卡没有问题，节点设置可调度
+每个步骤记录日志
+
+
+我先把脚本、镜像和 YAML 写出来，再用模拟的 `nvidia-smi` 和 `dmesg` 验证检测逻辑。
+
+The test ran under sh instead of bash, so the shell never sourced the script. I'll rerun it with bash.
+
+检测逻辑通过：正常、ECC 错误、掉卡、驱动挂死和致命 Xid 都能识别，非致命的 Xid 31 被忽略。接下来生成 Dockerfile 和 YAML。
+
+我写好了 DaemonSet 的完整实现，包括主脚本、镜像 Dockerfile 和一份 YAML。YAML 里有 ServiceAccount、RBAC、ConfigMap（内嵌脚本）和 DaemonSet。我只用模拟的 `nvidia-smi` 和 `dmesg` 验证了检测部分，没有在真实集群里跑过 drain 和重启流程，请先在一个测试节点上试。
+
+## 工作方式
+
+每个节点上的 Pod 按固定间隔巡检，每一步都写日志，日志同时输出到 stdout 和宿主机的 `/var/lib/gpu-guard/gpu-guard.log`。
+
+| 步骤 | 做什么 |
+|---|---|
+| 检测 | 判断以下四类故障：<br>1. `nvidia-smi` 执行失败或超时，说明驱动异常。<br>2. 对比历史卡清单发现掉卡，按 PCI 槽位比对。<br>3. 存在不可纠正 ECC 错误、显存页面退役待处理、行重映射失败或待重置。<br>4. `dmesg` 中有致命 Xid，默认是 48/62/64/74/79/95/119/120/140。 |
+| [1/6] 记录 | 日志里记录卡号、UUID、PCI 地址和具体故障，同时写入 Node 的 annotation（`fault-detail`、`fault-time`），`kubectl describe node` 就能看到。 |
+| [2/6] cordon | 设置节点不可调度。 |
+| [3/6] 排水 | 执行 `kubectl drain`，并循环确认业务 Pod 已清空，被 PDB 卡住会继续重试。 |
+| [4/6] 重启或关机 | 默认 `reboot`，也可以设成 `poweroff`。设成 `poweroff` 时需要有人或 BMC 把机器重新开机。 |
+| [5/6] 复检 | 开机后通过 `boot_id` 变化判断主机已重启，然后等 GPU 就绪并复检，最长等 15 分钟。 |
+| [6/6] 恢复 | 复检通过就 uncordon 并清理状态。 |
+
+流程状态存在 Node 的 label 里（`gpu-guard.k8s.io/state`）。Pod 随主机重启后会从断点继续，不依赖本地内存。
+
+## 额外加的保护
+
+- **只恢复自己 cordon 的节点**：如果节点原本就被管理员手动 cordon，复检通过后不会被误解除。
+- **重启后仍有故障**：节点保持不可调度，状态置为 `failed`，不会再次自动重启。人工修复后，下次巡检发现健康会自动恢复。
+- **防反复重启**：恢复后 1 小时内再次故障，只 cordon 并转人工，不再自动重启。
+- **限制并发**：默认同一时间只处理 1 个节点（`MAX_CONCURRENT`）。这能避免驱动或脚本误判时，整个集群被连锁排空。多个节点同时出故障时可能有小概率竞态，要彻底避免可以改用 Lease 加锁。
+- **排水超时不强制关机**：默认不强制，因为强行关机可能影响业务。需要强制可设 `FORCE_AFTER_DRAIN_TIMEOUT=true`。
+
+## 部署步骤
+
+1. 构建镜像并推送，把 YAML 里的 `image` 改成你的地址：
+   ```bash
+   docker build -t your-registry/gpu-guard:1.0 . && docker push your-registry/gpu-guard:1.0
+   ```
+2. 给要守护的节点打标签，建议先只选一个测试节点：
+   ```bash
+   kubectl label node <node> gpu-guard.k8s.io/enabled=true
+   ```
+3. 部署：`kubectl apply -f gpu-guard.yaml`
+4. 查看日志：`kubectl -n kube-system logs -l app=gpu-guard -f`
+
+## 需要注意的几点
+
+- **宿主机需要有 `nvidia-smi`**：容器通过 `nsenter` 进入宿主机执行，所以镜像里不需要 CUDA，也不依赖 nvidia runtime。
+- **Pod 权限较高**：它需要 `privileged` 和 `hostPID` 才能执行宿主机命令，请评估集群的安全策略。
+- **换卡后清理已知卡清单**：如果有卡被主动拆除，需要删掉该节点上的 `/var/lib/gpu-guard/known-gpus`，否则会一直被判为掉卡。
+- **调整致命 Xid 清单**：默认清单是常见的硬件类 Xid，建议按你们的 GPU 型号和运维经验调整环境变量 `FATAL_XIDS`。
+- **按需设置期望卡数**：如果每台机器的卡数固定，建议设置 `EXPECTED_GPU_COUNT`，作为兜底检查。
+
+需要我加上告警通知（如钉钉、飞书、Webhook）或 Prometheus 指标吗？
+
+
+加上告警通知（如钉钉、飞书、Webhook）或 Prometheus 指标
+我来加上三类通知（钉钉、飞书、通用 Webhook）和 Prometheus 指标，并附带 PodMonitor 与告警规则。改完后用模拟的 kubectl 和 Webhook 服务把整条流程跑一遍。
+
+测试环境齐了，现在写新版脚本。
+
+先搭测试环境：一个模拟的 kubectl（用文件保存节点状态）、一个模拟主机重启的 hostexec 包装、以及一个会校验返回格式的 Webhook 接收服务。
+
+后台起的 Python 服务占住了命令的输出，导致卡住。我检查一下哪些文件已经写好，再用 nohup 重新启动服务。
+
+先跑完整流程：先让 GPU 健康，3 秒后制造掉卡，看它能否走完“排水、重启、复检、恢复”，并向三个渠道发通知。
+
+通知发出后日志就停了，我看看是卡住了还是已经结束。
+
+不是真卡住，是我的模拟 kubectl 有个 bug：写 label 和 annotation 时取错了参数，状态没保存成功。修复模拟程序后重跑。
+
+`pkill -f` 把执行命令的 shell 自己也杀了。我分步重来，并避免这个误杀。
+
+6 秒内就走完整条链路了，指标也已回到健康状态。看日志和收到的通知。
+
+再测更难的场景：重启后故障依然存在。预期是进入 failed 状态、发 critical 通知、周期性提醒，人工修好后自动恢复。
+
+我的命令文本里含 `run.sh`，又把自己匹配上杀掉了。清理单独做，用不会匹配到自己的写法。
+
+单卡维度也对：GPU1 标记为故障，GPU0 保持健康。接着确认它不会再次重启，再模拟人工修好。
+
+已经加好钉钉、飞书、通用 Webhook 三类通知和 Prometheus 指标，另附一个监控文件 `gpu-guard-monitoring.yaml`（PodMonitor 加 7 条告警规则）。
+
+我用模拟的 kubectl、nvidia-smi 和 Webhook 服务端到端测过，没有在真实集群和真实机器人上跑过，请先在一个测试节点上验证。测试覆盖了：
+- 故障后完整走通六步并恢复
+- 重启后故障仍在，进入 failed 并周期提醒，修好后自动恢复
+- 恢复后短时间内再次故障，不再自动重启
+- 指标端点响应头和语法
+- 某个通知渠道不可用时不影响主流程
+
+钉钉和飞书的签名我用 Python 独立重算过，结果一致。
+
+## 通知
+
+在 `gpu-guard-notify` 这个 Secret 里填 URL，填了哪个就启用哪个，可以同时启用多个。留空表示不启用。
+
+| 渠道 | 配置项 | 说明 |
+|---|---|---|
+| 钉钉 | `NOTIFY_DINGTALK_URL`、`NOTIFY_DINGTALK_SECRET` | 支持“加签” |
+| 飞书 | `NOTIFY_FEISHU_URL`、`NOTIFY_FEISHU_SECRET` | 支持“签名校验” |
+| Webhook | `NOTIFY_WEBHOOK_URL`、`NOTIFY_WEBHOOK_TOKEN` | JSON POST，设置 token 后带 `Authorization: Bearer` |
+
+发送通知的时机：
+
+| 事件 | 级别 | 触发时机 |
+|---|---|---|
+| `fault_detected` | critical | 检测到故障，附卡号和详情 |
+| `rebooting` | warning | 排空后、下发重启命令之前 |
+| `recovered` | info | 复检通过并恢复可调度，附总耗时 |
+| `recovery_failed` | critical | 重启后故障仍在，转人工 |
+| `failed_reminder` | critical | failed 状态下每小时重复提醒 |
+| `flapping` | critical | 恢复后 1 小时内再次故障，不再自动重启 |
+| `drain_blocked` | warning | 排水超时，可能被 PDB 阻塞 |
+| `queued` | warning | 并发已满，本节点排队 |
+
+- **发送顺序**：`rebooting` 通知一定在重启命令之前发出，否则主机下线后就发不出去了。
+- **失败处理**：通知发送失败只记日志和计数，不会影响主流程。
+- **Webhook payload**：带结构化的 `faults` 字段，可以直接对接你们自己的系统。
+- **配置项**：
+  - `NOTIFY_EVENTS` 可以筛选要发哪些事件。
+  - `NOTIFY_AT_ALL=true` 可让 critical 级别 @所有人。
+  - `NOTIFY_PREFIX` 默认是 `[GPU-Guard]`，机器人启用了“关键词”校验时，请让前缀包含该关键词。
+
+## Prometheus 指标
+
+端点是每个节点的 `:9477/metrics`，也提供 `/healthz`。因为用了 hostNetwork，端口就是宿主机端口，请注意防火墙。主要指标：
+
+| 指标 | 含义 |
+|---|---|
+| `gpu_guard_node_state{state}` | 当前处置状态，当前状态为 1 |
+| `gpu_guard_gpu_healthy{gpu,uuid,pci}` | 单卡健康 1/0 |
+| `gpu_guard_gpu_fault{type,...}` | 当前存在的具体故障，类型有 `smi_failed`、`missing`、`ecc_uncorrected`、`xid` 等 |
+| `gpu_guard_fault_events_total` | 累计故障次数 |
+| `gpu_guard_host_actions_total{action}` | 累计重启、关机次数 |
+| `gpu_guard_recoveries_total`、`gpu_guard_recovery_failures_total` | 恢复成功、失败次数 |
+| `gpu_guard_drain_timeouts_total` | 累计排水超时次数 |
+| `gpu_guard_last_drain_duration_seconds`、`gpu_guard_last_downtime_seconds` | 最近一次排水耗时、故障总耗时 |
+| `gpu_guard_notifications_total{channel,result}` | 各渠道通知成败次数 |
+
+计数器持久化在宿主机的 `/var/lib/gpu-guard`，所以节点重启后不会归零。
+
+## 部署
+
+1. 构建镜像：`docker build -t your-registry/gpu-guard:2.0 .`，Dockerfile 新增了 curl、openssl、socat。
+2. 修改 `gpu-guard.yaml` 里的镜像地址和 `CLUSTER_NAME`，在 Secret 里填入通知渠道。
+3. 部署：`kubectl apply -f gpu-guard.yaml`。
+4. 集群有 Prometheus Operator 的话，再 `kubectl apply -f gpu-guard-monitoring.yaml`。如果你的 Prometheus 靠 label 选择 PodMonitor 和 PrometheusRule，需要在 metadata 里补上对应 label。
+
+## 需要注意
+
+- **告警接收端需要自己配**：我在监控文件里写的 7 条告警规则，需要你们的 Alertmanager 路由到团队的接收渠道，否则只会在 Prometheus 里触发。
+- **节点重启期间指标会暂时消失**：因为 Pod 随主机一起下线，所以“指标过期”类告警不会误报。
+- **旧版本升级**：如果之前已经部署了 v1，滚动更新到 v2 时，已有节点的 label、annotation 和已知 GPU 清单会沿用，不需要清理。
+

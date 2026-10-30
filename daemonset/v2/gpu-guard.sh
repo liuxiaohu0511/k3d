@@ -1,0 +1,636 @@
+#!/usr/bin/env bash
+# gpu-guard v2: NVIDIA GPU 故障自动处置 + 告警通知 + Prometheus 指标
+# 流程: 检测 -> 记录故障 -> cordon -> drain(等待排空) -> 重启/关机 -> 开机后复检 -> uncordon
+# 状态保存在 Node 的 label/annotation 中, Pod 随主机重启后可从断点继续.
+# 计数器等持久数据保存在 hostPath(DATA_DIR), 重启后不丢失.
+set -uo pipefail
+
+VERSION="2.0"
+########################## 配置(均可通过环境变量覆盖) ##########################
+NODE_NAME="${NODE_NAME:?NODE_NAME 未设置}"
+CLUSTER_NAME="${CLUSTER_NAME:-}"
+NODE_IP="${NODE_IP:-}"
+CHECK_INTERVAL="${CHECK_INTERVAL:-60}"              # 巡检间隔(秒)
+ACTION="${ACTION:-reboot}"                          # reboot | poweroff
+EXPECTED_GPU_COUNT="${EXPECTED_GPU_COUNT:-0}"       # 期望卡数, 0=不检查(仍会与历史已知卡对比)
+SMI_TIMEOUT="${SMI_TIMEOUT:-30}"                    # nvidia-smi 超时(秒)
+FATAL_XIDS="${FATAL_XIDS:-48 62 64 74 79 95 119 120 140}"   # 视为致命的 Xid
+DRAIN_ATTEMPT_TIMEOUT="${DRAIN_ATTEMPT_TIMEOUT:-300}"       # 单次 kubectl drain 超时
+DRAIN_TOTAL_TIMEOUT="${DRAIN_TOTAL_TIMEOUT:-3600}"          # 排水总等待上限
+FORCE_AFTER_DRAIN_TIMEOUT="${FORCE_AFTER_DRAIN_TIMEOUT:-false}"  # 排水超时是否仍强制关机
+RECOVER_WAIT="${RECOVER_WAIT:-900}"                 # 开机后等待GPU恢复的最长时间(秒)
+REBOOT_WAIT_RETRY="${REBOOT_WAIT_RETRY:-600}"       # 发出重启命令后多久仍未重启则重发
+FLAP_WINDOW="${FLAP_WINDOW:-3600}"                  # 恢复后该时间内再次故障 => 不再自动重启, 转人工
+MAX_CONCURRENT="${MAX_CONCURRENT:-1}"               # 集群内同时处理的节点数上限(防误判雪崩)
+HEALTH_LOG_EVERY="${HEALTH_LOG_EVERY:-30}"          # 健康时每N次巡检打一条日志
+DATA_DIR="${DATA_DIR:-/data}"
+# 在宿主机命名空间执行命令(需 privileged + hostPID); 测试时可覆盖
+HOST_EXEC="${HOST_EXEC-nsenter -t 1 -m -u -i -n -p --}"
+
+# ---- 通知(留空=不启用该渠道) ----
+NOTIFY_PREFIX="${NOTIFY_PREFIX:-[GPU-Guard]}"       # 消息前缀, 机器人设置了"关键词"时请包含该关键词
+NOTIFY_DINGTALK_URL="${NOTIFY_DINGTALK_URL:-}"      # 钉钉机器人 webhook(含 access_token)
+NOTIFY_DINGTALK_SECRET="${NOTIFY_DINGTALK_SECRET:-}" # 钉钉"加签"密钥(SEC开头), 可空
+NOTIFY_FEISHU_URL="${NOTIFY_FEISHU_URL:-}"          # 飞书机器人 webhook
+NOTIFY_FEISHU_SECRET="${NOTIFY_FEISHU_SECRET:-}"    # 飞书"签名校验"密钥, 可空
+NOTIFY_WEBHOOK_URL="${NOTIFY_WEBHOOK_URL:-}"        # 通用 Webhook(接收 JSON POST)
+NOTIFY_WEBHOOK_TOKEN="${NOTIFY_WEBHOOK_TOKEN:-}"    # 若设置, 发送 Authorization: Bearer <token>
+NOTIFY_AT_ALL="${NOTIFY_AT_ALL:-false}"             # critical 级别是否 @所有人(钉钉/飞书)
+NOTIFY_EVENTS="${NOTIFY_EVENTS:-fault_detected,queued,drain_blocked,rebooting,recovered,recovery_failed,flapping,failed_reminder}"
+NOTIFY_REMIND_INTERVAL="${NOTIFY_REMIND_INTERVAL:-3600}"   # failed 状态下的重复提醒间隔(秒)
+NOTIFY_QUEUE_INTERVAL="${NOTIFY_QUEUE_INTERVAL:-1800}"     # 排队提醒的最小间隔(秒)
+
+# ---- Prometheus ----
+METRICS_ENABLED="${METRICS_ENABLED:-true}"
+METRICS_PORT="${METRICS_PORT:-9477}"
+
+LOG_FILE="$DATA_DIR/gpu-guard.log"
+KNOWN_FILE="$DATA_DIR/known-gpus"
+FAULT_ITEMS_FILE="$DATA_DIR/fault-items"
+METRICS_FILE="$DATA_DIR/metrics.prom"
+LABEL_STATE="gpu-guard.k8s.io/state"   # healthy|draining|rebooting|recovering|failed
+ANN="gpu-guard.k8s.io"
+FATAL_RE="$(echo $FATAL_XIDS | tr ' ' '|')"
+
+mkdir -p "$DATA_DIR/kv" 2>/dev/null || true
+
+########################## 日志 ##########################
+log() {
+  local lvl="$1"; shift
+  local line
+  line="$(date '+%F %T%z') [$lvl] [$NODE_NAME] $*"
+  echo "$line"
+  if [ -f "$LOG_FILE" ] && [ "$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)" -gt 52428800 ]; then
+    mv -f "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null || true
+  fi
+  echo "$line" >> "$LOG_FILE" 2>/dev/null || true
+}
+log_lines() { # log_lines LEVEL "多行文本"
+  local lvl="$1" l
+  while IFS= read -r l; do [ -n "$l" ] && log "$lvl" "$l"; done <<<"$2"
+}
+bullets() { grep . <<<"$1" | sed 's/^/- /'; }
+trim() { local s="$*"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+
+########################## 持久化计数器/数值 ##########################
+kv_get()      { cat "$DATA_DIR/kv/$1" 2>/dev/null || echo 0; }
+kv_set()      { echo "$2" > "$DATA_DIR/kv/$1" 2>/dev/null || true; }
+counter_inc() { kv_set "$1" $(( $(kv_get "$1") + 1 )); }
+
+########################## 通知 ##########################
+# post_json CHANNEL URL PAYLOAD [额外curl参数...]  -> 成功返回0
+post_json() {
+  local ch="$1" url="$2" payload="$3" resp rc code body ok=""
+  shift 3
+  resp=$(curl -sS --connect-timeout 5 --max-time 10 --retry 1 \
+         -H 'Content-Type: application/json' "$@" -d "$payload" \
+         -w $'\n%{http_code}' "$url" 2>&1); rc=$?
+  code="${resp##*$'\n'}"; body="${resp%$'\n'*}"
+  if [ $rc -eq 0 ] && [[ "$code" == 2* ]]; then
+    case "$ch" in
+      dingtalk) ok=$(jq -r '.errcode==0' <<<"$body" 2>/dev/null) ;;
+      feishu)   ok=$(jq -r '(.code==0) or (.StatusCode==0)' <<<"$body" 2>/dev/null) ;;
+      *)        ok=true ;;
+    esac
+  fi
+  if [ "$ok" = "true" ]; then
+    counter_inc "notify_${ch}_ok"; log INFO "通知已发送: $ch"; return 0
+  fi
+  counter_inc "notify_${ch}_fail"
+  log WARN "通知发送失败: $ch (rc=$rc http=$code) $(tr '\n' ' ' <<<"$body" | cut -c1-200)"
+  return 1
+}
+
+send_dingtalk() { # level text
+  local url="$NOTIFY_DINGTALK_URL" ts sig payload at=false
+  [ "$1" = "critical" ] && [ "$NOTIFY_AT_ALL" = "true" ] && at=true
+  if [ -n "$NOTIFY_DINGTALK_SECRET" ]; then
+    ts=$(( $(date +%s) * 1000 ))
+    sig=$(printf '%s\n%s' "$ts" "$NOTIFY_DINGTALK_SECRET" \
+          | openssl dgst -sha256 -hmac "$NOTIFY_DINGTALK_SECRET" -binary | openssl base64 -A)
+    sig=$(jq -rn --arg s "$sig" '$s|@uri')
+    url="${url}&timestamp=${ts}&sign=${sig}"
+  fi
+  payload=$(jq -nc --arg t "$2" --argjson at "$at" \
+            '{msgtype:"text", text:{content:$t}, at:{isAtAll:$at}}')
+  post_json dingtalk "$url" "$payload"
+}
+
+send_feishu() { # level text
+  local ts sig payload text="$2"
+  [ "$1" = "critical" ] && [ "$NOTIFY_AT_ALL" = "true" ] && text="<at user_id=\"all\">所有人</at> $text"
+  if [ -n "$NOTIFY_FEISHU_SECRET" ]; then
+    ts=$(date +%s)
+    # 飞书签名: 以 "timestamp\nsecret" 作为 HMAC 密钥, 对空消息计算
+    sig=$(printf '' | openssl dgst -sha256 -hmac "$(printf '%s\n%s' "$ts" "$NOTIFY_FEISHU_SECRET")" -binary | openssl base64 -A)
+    payload=$(jq -nc --arg t "$text" --arg ts "$ts" --arg sig "$sig" \
+              '{timestamp:$ts, sign:$sig, msg_type:"text", content:{text:$t}}')
+  else
+    payload=$(jq -nc --arg t "$text" '{msg_type:"text", content:{text:$t}}')
+  fi
+  post_json feishu "$NOTIFY_FEISHU_URL" "$payload"
+}
+
+send_webhook() { # event level title body text
+  local payload
+  payload=$(jq -nc --arg event "$1" --arg level "$2" --arg title "$3" --arg body "$4" --arg text "$5" \
+      --arg cluster "$CLUSTER_NAME" --arg node "$NODE_NAME" --arg ip "$NODE_IP" \
+      --arg time "$(date -Is)" --arg action "$ACTION" --arg faults "$(cat "$FAULT_ITEMS_FILE" 2>/dev/null)" \
+      '{source:"gpu-guard", event:$event, level:$level, title:$title, cluster:$cluster, node:$node,
+        node_ip:$ip, time:$time, action:$action, message:$text, detail:$body,
+        faults:($faults | split("\n") | map(select(length>0)
+                 | split("|") | {type:.[0], gpu:.[1], uuid:.[2], pci:.[3]}))}')
+  if [ -n "$NOTIFY_WEBHOOK_TOKEN" ]; then
+    post_json webhook "$NOTIFY_WEBHOOK_URL" "$payload" -H "Authorization: Bearer $NOTIFY_WEBHOOK_TOKEN"
+  else
+    post_json webhook "$NOTIFY_WEBHOOK_URL" "$payload"
+  fi
+}
+
+# notify EVENT LEVEL(critical|warning|info) TITLE BODY ; 失败只记日志, 绝不影响主流程
+notify() {
+  local event="$1" level="$2" title="$3" body="${4:-}" icon text
+  [[ ",$NOTIFY_EVENTS," == *",$event,"* ]] || return 0
+  [ -n "$NOTIFY_DINGTALK_URL$NOTIFY_FEISHU_URL$NOTIFY_WEBHOOK_URL" ] || return 0
+  case "$level" in critical) icon="🔴";; warning) icon="🟠";; *) icon="🟢";; esac
+  text="$NOTIFY_PREFIX $icon $title"$'\n'"集群: ${CLUSTER_NAME:-N/A}"$'\n'"节点: $NODE_NAME${NODE_IP:+ ($NODE_IP)}"$'\n'"时间: $(date '+%F %T %Z')"
+  [ -n "$body" ] && text+=$'\n'"$body"
+  [ -n "$NOTIFY_DINGTALK_URL" ] && { send_dingtalk "$level" "$text" || true; }
+  [ -n "$NOTIFY_FEISHU_URL" ]   && { send_feishu   "$level" "$text" || true; }
+  [ -n "$NOTIFY_WEBHOOK_URL" ]  && { send_webhook "$event" "$level" "$title" "$body" "$text" || true; }
+  return 0
+}
+
+########################## Prometheus 指标 ##########################
+METRIC_STATE="unknown"; LAST_CHECK_OK=1; LAST_CHECK_TS=0; LAST_GPU_COUNT=0
+
+write_metrics() {
+  [ "$METRICS_ENABLED" = "true" ] || return 0
+  local n="$NODE_NAME" tmp="$DATA_DIR/.metrics.tmp" s
+  {
+    echo '# HELP gpu_guard_info gpu-guard 版本与配置'
+    echo '# TYPE gpu_guard_info gauge'
+    echo "gpu_guard_info{node=\"$n\",version=\"$VERSION\",action=\"$ACTION\"} 1"
+    echo '# HELP gpu_guard_last_update_timestamp_seconds 指标最后刷新时间'
+    echo '# TYPE gpu_guard_last_update_timestamp_seconds gauge'
+    echo "gpu_guard_last_update_timestamp_seconds{node=\"$n\"} $(date +%s)"
+    echo '# HELP gpu_guard_node_state 节点当前处置状态(当前状态为1)'
+    echo '# TYPE gpu_guard_node_state gauge'
+    for s in healthy draining rebooting recovering failed; do
+      echo "gpu_guard_node_state{node=\"$n\",state=\"$s\"} $([ "$METRIC_STATE" = "$s" ] && echo 1 || echo 0)"
+    done
+    echo '# HELP gpu_guard_last_check_healthy 最近一次巡检是否健康(1健康/0故障)'
+    echo '# TYPE gpu_guard_last_check_healthy gauge'
+    echo "gpu_guard_last_check_healthy{node=\"$n\"} $LAST_CHECK_OK"
+    echo '# HELP gpu_guard_last_check_timestamp_seconds 最近一次巡检时间'
+    echo '# TYPE gpu_guard_last_check_timestamp_seconds gauge'
+    echo "gpu_guard_last_check_timestamp_seconds{node=\"$n\"} $LAST_CHECK_TS"
+    echo '# HELP gpu_guard_gpu_count 最近一次巡检识别到的GPU数量'
+    echo '# TYPE gpu_guard_gpu_count gauge'
+    echo "gpu_guard_gpu_count{node=\"$n\"} $LAST_GPU_COUNT"
+
+    local items; items=$(cat "$FAULT_ITEMS_FILE" 2>/dev/null)
+    echo '# HELP gpu_guard_gpu_healthy 单卡是否健康(1健康/0故障), 基于本机已知GPU清单'
+    echo '# TYPE gpu_guard_gpu_healthy gauge'
+    if [ -s "$KNOWN_FILE" ]; then
+      local kpci kidx kuuid kname h t i u p
+      while IFS='|' read -r kpci kidx kuuid kname; do
+        [ -z "$kpci" ] && continue
+        h=1
+        while IFS='|' read -r t i u p; do
+          [ -z "$t" ] && continue
+          if [ "$i" = "all" ] || [ "$i" = "$kidx" ]; then h=0; fi
+        done <<<"$items"
+        echo "gpu_guard_gpu_healthy{node=\"$n\",gpu=\"$kidx\",uuid=\"$kuuid\",pci=\"$kpci\"} $h"
+      done <"$KNOWN_FILE"
+    fi
+    echo '# HELP gpu_guard_gpu_fault 当前存在的GPU故障(type为故障类型)'
+    echo '# TYPE gpu_guard_gpu_fault gauge'
+    local t i u p
+    while IFS='|' read -r t i u p; do
+      [ -z "$t" ] && continue
+      echo "gpu_guard_gpu_fault{node=\"$n\",gpu=\"$i\",uuid=\"$u\",pci=\"$p\",type=\"$t\"} 1"
+    done <<<"$items"
+
+    echo '# HELP gpu_guard_fault_events_total 累计故障事件数(每次故障过程计1次)'
+    echo '# TYPE gpu_guard_fault_events_total counter'
+    echo "gpu_guard_fault_events_total{node=\"$n\"} $(kv_get fault_events)"
+    echo '# HELP gpu_guard_host_actions_total 累计对主机执行重启/关机次数'
+    echo '# TYPE gpu_guard_host_actions_total counter'
+    echo "gpu_guard_host_actions_total{node=\"$n\",action=\"reboot\"} $(kv_get host_action_reboot)"
+    echo "gpu_guard_host_actions_total{node=\"$n\",action=\"poweroff\"} $(kv_get host_action_poweroff)"
+    echo '# HELP gpu_guard_recoveries_total 累计恢复成功次数'
+    echo '# TYPE gpu_guard_recoveries_total counter'
+    echo "gpu_guard_recoveries_total{node=\"$n\"} $(kv_get recoveries)"
+    echo '# HELP gpu_guard_recovery_failures_total 累计重启后复检仍失败次数'
+    echo '# TYPE gpu_guard_recovery_failures_total counter'
+    echo "gpu_guard_recovery_failures_total{node=\"$n\"} $(kv_get recovery_failures)"
+    echo '# HELP gpu_guard_drain_timeouts_total 累计排水超时次数'
+    echo '# TYPE gpu_guard_drain_timeouts_total counter'
+    echo "gpu_guard_drain_timeouts_total{node=\"$n\"} $(kv_get drain_timeouts)"
+    echo '# HELP gpu_guard_notifications_total 通知发送次数'
+    echo '# TYPE gpu_guard_notifications_total counter'
+    for s in dingtalk feishu webhook; do
+      echo "gpu_guard_notifications_total{node=\"$n\",channel=\"$s\",result=\"ok\"} $(kv_get notify_${s}_ok)"
+      echo "gpu_guard_notifications_total{node=\"$n\",channel=\"$s\",result=\"fail\"} $(kv_get notify_${s}_fail)"
+    done
+    echo '# HELP gpu_guard_last_fault_timestamp_seconds 最近一次发现故障的时间'
+    echo '# TYPE gpu_guard_last_fault_timestamp_seconds gauge'
+    echo "gpu_guard_last_fault_timestamp_seconds{node=\"$n\"} $(kv_get last_fault_ts)"
+    echo '# HELP gpu_guard_last_recovery_timestamp_seconds 最近一次恢复成功的时间'
+    echo '# TYPE gpu_guard_last_recovery_timestamp_seconds gauge'
+    echo "gpu_guard_last_recovery_timestamp_seconds{node=\"$n\"} $(kv_get last_recovery_ts)"
+    echo '# HELP gpu_guard_last_drain_duration_seconds 最近一次排水耗时'
+    echo '# TYPE gpu_guard_last_drain_duration_seconds gauge'
+    echo "gpu_guard_last_drain_duration_seconds{node=\"$n\"} $(kv_get last_drain_duration)"
+    echo '# HELP gpu_guard_last_downtime_seconds 最近一次从发现故障到恢复可调度的总耗时'
+    echo '# TYPE gpu_guard_last_downtime_seconds gauge'
+    echo "gpu_guard_last_downtime_seconds{node=\"$n\"} $(kv_get last_downtime)"
+  } > "$tmp" 2>/dev/null && mv -f "$tmp" "$METRICS_FILE"
+  return 0
+}
+
+# 极简 HTTP 服务(由 socat 为每个连接拉起一个本脚本进程: gpu-guard.sh --http)
+serve_http() {
+  export LC_ALL=C
+  local line h path code ctype
+  IFS= read -r -t 5 line || exit 0
+  while IFS= read -r -t 2 h; do h="${h%$'\r'}"; [ -z "$h" ] && break; done
+  set -- $line; path="${2:-/}"; path="${path%%\?*}"
+  case "$path" in
+    /metrics)
+      if [ -f "$METRICS_FILE" ]; then
+        printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: %s\r\nConnection: close\r\n\r\n' \
+          "$(wc -c < "$METRICS_FILE")"
+        cat "$METRICS_FILE"
+      else
+        printf 'HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'
+      fi ;;
+    /healthz) printf 'HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n' ;;
+    *)        printf 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n' ;;
+  esac
+}
+
+start_metrics_server() {
+  [ "$METRICS_ENABLED" = "true" ] || return 0
+  local self; self="$(readlink -f "$0")"
+  (
+    while :; do
+      socat "TCP-LISTEN:${METRICS_PORT},fork,reuseaddr" "SYSTEM:/bin/bash $self --http" 2>&1 \
+        | while IFS= read -r l; do log WARN "metrics server: $l"; done
+      log WARN "metrics server 退出, 5s后重启"; sleep 5
+    done
+  ) &
+  log INFO "Prometheus 指标已启用: :${METRICS_PORT}/metrics"
+}
+
+########################## Node 状态读写 ##########################
+get_state() {
+  local j
+  j=$(kubectl get node "$NODE_NAME" -o json 2>/dev/null) || { echo unknown; return; }
+  jq -r --arg k "$LABEL_STATE" '.metadata.labels[$k] // "healthy"' <<<"$j"
+}
+set_state() {
+  kubectl label node "$NODE_NAME" --overwrite "$LABEL_STATE=$1" >/dev/null 2>&1 || return 1
+  METRIC_STATE="$1"; log INFO "节点状态 -> $1"; write_metrics
+}
+get_ann()   { kubectl get node "$NODE_NAME" -o json 2>/dev/null | jq -r --arg k "$ANN/$1" '.metadata.annotations[$k] // ""'; }
+set_ann()   { kubectl annotate node "$NODE_NAME" --overwrite "$ANN/$1=$2" >/dev/null 2>&1; }
+del_ann()   { kubectl annotate node "$NODE_NAME" "$ANN/$1-" >/dev/null 2>&1 || true; }
+host_boot_id() { $HOST_EXEC cat /proc/sys/kernel/random/boot_id 2>/dev/null | tr -d '[:space:]'; }
+
+########################## GPU 检查 ##########################
+CUR_GPUS=""      # 每行: pci|index|uuid|name
+FAULTS=""        # 每行一条故障描述(人读)
+FAULT_ITEMS=""   # 每行: type|gpu_index|uuid|pci (机读, 用于指标与Webhook)
+
+add_fault() { # type idx uuid pci message
+  FAULTS+="$5"$'\n'
+  FAULT_ITEMS+="$1|$2|$3|$4"$'\n'
+}
+
+_check_gpus_core() {
+  FAULTS=""; FAULT_ITEMS=""; CUR_GPUS=""; LAST_GPU_COUNT=0
+  local out rc
+  out=$(timeout "$SMI_TIMEOUT" $HOST_EXEC nvidia-smi \
+        --query-gpu=index,uuid,pci.bus_id,name --format=csv,noheader 2>&1); rc=$?
+  if [ $rc -ne 0 ]; then
+    add_fault smi_failed all "" "" "nvidia-smi 执行失败(rc=$rc), 可能掉卡/驱动异常/超时: $(tr '\n' ' ' <<<"$out" | cut -c1-400)"
+    [ -s "$KNOWN_FILE" ] && FAULTS+="本机已知GPU(可能受影响): $(awk -F'|' 'NF>=2{printf "GPU%s[%s] ",$2,$1}' "$KNOWN_FILE")"$'\n'
+    return 1
+  fi
+
+  local idx uuid pci name
+  while IFS=',' read -r idx uuid pci name; do
+    [ -z "$(trim "$idx")" ] && continue
+    pci="$(trim "$pci")"
+    CUR_GPUS+="${pci,,}|$(trim "$idx")|$(trim "$uuid")|$(trim "$name")"$'\n'
+  done <<<"$out"
+  local n; n=$(grep -c . <<<"$CUR_GPUS"); LAST_GPU_COUNT=$n
+
+  # 1) 与历史已知卡对比(以PCI槽位为键, 换卡后同槽位不受影响)
+  if [ -s "$KNOWN_FILE" ]; then
+    local kpci kidx kuuid kname
+    while IFS='|' read -r kpci kidx kuuid kname; do
+      [ -z "$kpci" ] && continue
+      grep -qiF "$kpci|" <<<"$CUR_GPUS" || \
+        add_fault missing "$kidx" "$kuuid" "$kpci" "GPU$kidx 丢失(掉卡): pci=$kpci uuid=$kuuid name=$kname"
+    done <"$KNOWN_FILE"
+  fi
+  if [ "$EXPECTED_GPU_COUNT" -gt 0 ] && [ "$n" -lt "$EXPECTED_GPU_COUNT" ] && [ -z "$FAULTS" ]; then
+    add_fault count_low all "" "" "GPU数量不足: 当前 $n, 期望 $EXPECTED_GPU_COUNT"
+  fi
+
+  # 2) ECC / 页面退役 / 行重映射(字段不被支持时仅告警, 不判故障)
+  local ext erc
+  ext=$(timeout "$SMI_TIMEOUT" $HOST_EXEC nvidia-smi \
+        --query-gpu=index,uuid,pci.bus_id,ecc.errors.uncorrected.volatile.total,retired_pages.pending,remapped_rows.failure,remapped_rows.pending \
+        --format=csv,noheader,nounits 2>&1); erc=$?
+  if [ $erc -eq 0 ]; then
+    local ecc rp rf rpend
+    while IFS=',' read -r idx uuid pci ecc rp rf rpend; do
+      idx=$(trim "$idx"); [ -z "$idx" ] && continue
+      uuid=$(trim "$uuid"); pci=$(trim "$pci"); ecc=$(trim "$ecc")
+      rp=$(trim "$rp"); rf=$(trim "$rf"); rpend=$(trim "$rpend")
+      [[ "$ecc" =~ ^[0-9]+$ ]] && [ "$ecc" -gt 0 ] && \
+        add_fault ecc_uncorrected "$idx" "$uuid" "$pci" "GPU$idx ($uuid, $pci) 存在不可纠正ECC错误(volatile): $ecc"
+      [ "${rp,,}" = "yes" ] && \
+        add_fault page_retirement_pending "$idx" "$uuid" "$pci" "GPU$idx ($uuid, $pci) 有待处理的显存页面退役(需重置/重启)"
+      [[ "$rf" =~ ^[0-9]+$ ]] && [ "$rf" -gt 0 ] && \
+        add_fault row_remap_failed "$idx" "$uuid" "$pci" "GPU$idx ($uuid, $pci) 显存行重映射失败(remapped_rows.failure=$rf), 建议更换"
+      [ "${rpend,,}" = "yes" ] && \
+        add_fault row_remap_pending "$idx" "$uuid" "$pci" "GPU$idx ($uuid, $pci) 显存行重映射待重置(remapped_rows.pending)"
+    done <<<"$ext"
+  else
+    log WARN "扩展指标(ECC/重映射)查询失败, 仅使用基础检查: $(tr '\n' ' ' <<<"$ext" | cut -c1-200)"
+  fi
+
+  # 3) 内核日志中的致命 Xid
+  local xl l xpci gl gidx guuid
+  xl=$($HOST_EXEC dmesg 2>/dev/null | grep -E "NVRM: Xid \([^)]*\): ($FATAL_RE)[ ,:]" | tail -n 10)
+  if [ -n "$xl" ]; then
+    while IFS= read -r l; do
+      xpci=$(sed -E 's/.*Xid \((PCI:)?([^)]*)\).*/\2/' <<<"$l")
+      gl=$(grep -iF "${xpci#0000:}" <<<"$CUR_GPUS" | head -n1)
+      gidx=$(cut -d'|' -f2 <<<"$gl"); guuid=$(cut -d'|' -f3 <<<"$gl")
+      add_fault xid "${gidx:-?}" "$guuid" "$xpci" "致命Xid: GPU${gidx:-?} pci=$xpci | $(cut -c1-300 <<<"$l")"
+    done <<<"$xl"
+  fi
+
+  if [ -z "$FAULTS" ]; then
+    printf '%s' "$CUR_GPUS" > "$KNOWN_FILE" 2>/dev/null || true
+    return 0
+  fi
+  FAULTS="$(sort -u <<<"$FAULTS")"$'\n'
+  FAULT_ITEMS="$(sort -u <<<"$FAULT_ITEMS")"$'\n'
+  return 1
+}
+
+check_gpus() {
+  _check_gpus_core; local rc=$?
+  LAST_CHECK_OK=$(( rc == 0 )); LAST_CHECK_TS=$(date +%s)
+  # 机读故障清单落盘(含重启后仍可用于指标); 健康时清空
+  if [ $rc -eq 0 ]; then : > "$FAULT_ITEMS_FILE"; else printf '%s' "$FAULT_ITEMS" > "$FAULT_ITEMS_FILE"; fi
+  return $rc
+}
+
+record_fault() {
+  set_ann fault-time "$(date -Is)"
+  set_ann fault-detail "$(tr '\n' ';' <<<"$FAULTS" | cut -c1-2000)"
+}
+
+########################## cordon / drain / shutdown ##########################
+cordon_node() {
+  log STEP "[2/6] 设置节点不可调度(cordon)"
+  local unsched
+  unsched=$(kubectl get node "$NODE_NAME" -o jsonpath='{.spec.unschedulable}' 2>/dev/null)
+  # 仅当节点原本可调度时才记录"由本程序cordon", 避免恢复时误解除管理员手动cordon
+  [ "$unsched" != "true" ] && set_ann cordoned-by-guard true
+  if kubectl cordon "$NODE_NAME" >/dev/null 2>&1; then
+    log OK "[2/6] 节点已不可调度"
+  else
+    log ERROR "[2/6] cordon 失败, 下次巡检重试"; return 1
+  fi
+}
+
+remaining_pods() { # 输出仍在节点上的非DaemonSet/非静态Pod; API失败返回非0
+  local j
+  j=$(kubectl get pods -A --field-selector "spec.nodeName=$NODE_NAME" -o json 2>/dev/null) || return 1
+  jq -r '.items[]
+    | select(.status.phase!="Succeeded" and .status.phase!="Failed")
+    | select(((.metadata.ownerReferences // []) | map(.kind=="DaemonSet") | any) | not)
+    | select((.metadata.annotations // {})["kubernetes.io/config.mirror"] == null)
+    | "\(.metadata.namespace)/\(.metadata.name)"' <<<"$j"
+}
+
+drain_node() {
+  local t0; t0=$(date +%s)
+  local deadline=$(( t0 + DRAIN_TOTAL_TIMEOUT )) n=0 out rem
+  while :; do
+    n=$((n+1))
+    log STEP "[3/6] 第${n}次排水(kubectl drain), 单次超时 ${DRAIN_ATTEMPT_TIMEOUT}s"
+    out=$(kubectl drain "$NODE_NAME" --ignore-daemonsets --delete-emptydir-data --force \
+          --timeout="${DRAIN_ATTEMPT_TIMEOUT}s" 2>&1)
+    log_lines INFO "drain: $(tail -n 20 <<<"$out")"
+    if rem=$(remaining_pods); then
+      if [ -z "$rem" ]; then
+        kv_set last_drain_duration $(( $(date +%s) - t0 ))
+        log OK "[3/6] 排水完成, 节点上已无业务Pod"; return 0
+      fi
+      log WARN "[3/6] 仍有 $(grep -c . <<<"$rem") 个Pod未驱逐: $(tr '\n' ' ' <<<"$rem" | cut -c1-400)"
+    else
+      log WARN "[3/6] 查询节点Pod失败(API不可用?)"
+    fi
+    write_metrics
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      counter_inc drain_timeouts
+      if [ "$FORCE_AFTER_DRAIN_TIMEOUT" = "true" ]; then
+        log WARN "[3/6] 排水超时 ${DRAIN_TOTAL_TIMEOUT}s, FORCE_AFTER_DRAIN_TIMEOUT=true, 强制继续"
+        notify drain_blocked warning "排水超时, 已强制继续关机" "超时 ${DRAIN_TOTAL_TIMEOUT}s, 未驱逐Pod: $(tr '\n' ' ' <<<"$rem" | cut -c1-500)"
+        return 0
+      fi
+      log ERROR "[3/6] 排水超时 ${DRAIN_TOTAL_TIMEOUT}s, 未排空, 不执行关机(可能被PDB阻塞), 稍后重试"
+      set_ann drain-blocked "$(date -Is)"
+      notify drain_blocked warning "排水超时, 未执行关机" "已等待 ${DRAIN_TOTAL_TIMEOUT}s, 仍有Pod未驱逐(可能被PDB/终结器阻塞), 将继续重试。未驱逐Pod: $(tr '\n' ' ' <<<"$rem" | cut -c1-500)"
+      return 1
+    fi
+    sleep 15
+  done
+}
+
+shutdown_host() {
+  local bid; bid=$(host_boot_id)
+  if [ -z "$bid" ] || ! set_ann boot-id "$bid" || ! set_ann rebooting-at "$(date +%s)"; then
+    log ERROR "[4/6] 记录 boot-id 失败, 取消本次关机, 稍后重试"; return 1
+  fi
+  del_ann drain-blocked
+  set_state rebooting
+  log STEP "[4/6] 排空完成, 执行 ${ACTION} (boot_id=$bid)"
+  counter_inc "host_action_${ACTION}"; write_metrics
+  # 通知必须在下发命令之前发送, 否则主机下线后就发不出去了
+  notify rebooting warning "节点已排空, 即将执行 ${ACTION}" "故障详情: $(get_ann fault-detail | cut -c1-600)"
+  $HOST_EXEC sync
+  case "$ACTION" in
+    poweroff) $HOST_EXEC systemctl poweroff ;;
+    *)        $HOST_EXEC systemctl reboot ;;
+  esac
+  log INFO "[4/6] ${ACTION} 命令已下发, 等待主机下线..."
+}
+
+########################## 故障处置主流程 ##########################
+FAULT_EPISODE=0       # 当前故障过程是否已登记/通知(避免每次巡检重复)
+LAST_QUEUE_NOTIFY=0
+LAST_REMIND=0
+
+process_fault() { # $1=0 新故障, 1=恢复上次进度
+  if [ "$1" = "0" ]; then
+    if [ "$FAULT_EPISODE" != "1" ]; then
+      FAULT_EPISODE=1
+      log STEP "[1/6] 检测到GPU故障, 开始记录详情"
+      log_lines FAULT "$FAULTS"
+      record_fault
+      set_ann fault-epoch "$(date +%s)"
+      counter_inc fault_events; kv_set last_fault_ts "$(date +%s)"; write_metrics
+      notify fault_detected critical "检测到GPU故障" "$(bullets "$FAULTS")"$'\n'"处置: cordon -> drain -> ${ACTION} -> 复检"
+    fi
+
+    local last others
+    last=$(get_ann last-recovered)
+    if [[ "$last" =~ ^[0-9]+$ ]] && [ $(( $(date +%s) - last )) -lt "$FLAP_WINDOW" ]; then
+      log ERROR "距上次恢复不足 ${FLAP_WINDOW}s 再次故障, 疑似反复故障, 不再自动重启, 仅cordon并转人工"
+      cordon_node; set_state failed
+      notify flapping critical "GPU反复故障, 已停止自动处置" "距上次恢复不足 ${FLAP_WINDOW}s 再次故障, 节点已cordon但不会自动重启, 请人工排查(换卡/报修)。"
+      return
+    fi
+    others=$(kubectl get nodes -l "$LABEL_STATE in (draining,rebooting,recovering)" -o name 2>/dev/null \
+             | grep -vx "node/$NODE_NAME" | grep -c .)
+    if [ "${others:-0}" -ge "$MAX_CONCURRENT" ]; then
+      log WARN "已有 $others 个节点在处理中(上限 $MAX_CONCURRENT), 本节点排队, 下次巡检再试"
+      if [ $(( $(date +%s) - LAST_QUEUE_NOTIFY )) -ge "$NOTIFY_QUEUE_INTERVAL" ]; then
+        LAST_QUEUE_NOTIFY=$(date +%s)
+        notify queued warning "GPU故障节点排队等待处置" "已有 $others 个节点在处理(并发上限 $MAX_CONCURRENT), 本节点暂未cordon, 待前者完成后自动处理。"
+      fi
+      return
+    fi
+    set_state draining || return
+  else
+    log INFO "继续上次未完成的处置流程(状态: draining)"
+  fi
+  cordon_node || return
+  drain_node  || return
+  shutdown_host
+}
+
+handle_rebooting() {
+  local cur old age ra
+  cur=$(host_boot_id); old=$(get_ann boot-id)
+  if [ -z "$old" ] || { [ -n "$cur" ] && [ "$cur" != "$old" ]; }; then
+    recover; return
+  fi
+  ra=$(get_ann rebooting-at); [[ "$ra" =~ ^[0-9]+$ ]] || ra=$(date +%s)
+  age=$(( $(date +%s) - ra ))
+  if [ "$age" -gt "$REBOOT_WAIT_RETRY" ]; then
+    log WARN "[4/6] 已过 ${age}s 主机仍未重启, 重新下发 ${ACTION}"
+    shutdown_host
+  else
+    log INFO "[4/6] 等待主机重启中(${age}s)"
+  fi
+}
+
+finish_recovery() {
+  local how="已恢复可调度(uncordon)"
+  log STEP "[6/6] GPU复检通过: $(grep -c . <<<"$CUR_GPUS") 张卡正常"
+  if [ "$(get_ann cordoned-by-guard)" = "true" ]; then
+    if kubectl uncordon "$NODE_NAME" >/dev/null 2>&1; then
+      log OK "[6/6] 节点已恢复可调度(uncordon)"
+    else
+      log ERROR "[6/6] uncordon 失败, 下次巡检重试"; return 1
+    fi
+  else
+    how="保持原调度状态(非本程序cordon)"
+    log INFO "[6/6] 节点并非由本程序cordon, 保持原状态不解除"
+  fi
+  local fe dt=0; fe=$(get_ann fault-epoch)
+  [[ "$fe" =~ ^[0-9]+$ ]] && dt=$(( $(date +%s) - fe ))
+  for k in fault-time fault-detail fault-epoch boot-id rebooting-at cordoned-by-guard drain-blocked; do del_ann "$k"; done
+  set_ann last-recovered "$(date +%s)"
+  counter_inc recoveries; kv_set last_recovery_ts "$(date +%s)"; kv_set last_downtime "$dt"
+  FAULT_EPISODE=0
+  set_state healthy
+  notify recovered info "GPU故障已恢复" "复检通过, $(grep -c . <<<"$CUR_GPUS") 张卡正常, 节点${how}。故障总耗时 $((dt/60)) 分钟。"
+}
+
+recover() {
+  set_state recovering
+  log STEP "[5/6] 主机已重启(boot_id 已变化), 开始复检GPU, 最长等待 ${RECOVER_WAIT}s"
+  local deadline=$(( $(date +%s) + RECOVER_WAIT ))
+  while :; do
+    if check_gpus; then finish_recovery; return; fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then break; fi
+    log WARN "[5/6] 复检未通过, 15s后重试: $(head -n1 <<<"$FAULTS" | cut -c1-200)"
+    write_metrics
+    sleep 15
+  done
+  log ERROR "[5/6] 重启后GPU仍有故障, 节点保持不可调度, 需人工处理(不会再次自动重启)"
+  log_lines FAULT "$FAULTS"
+  record_fault
+  counter_inc recovery_failures
+  set_state failed
+  LAST_REMIND=$(date +%s)
+  notify recovery_failed critical "重启后GPU仍有故障, 需人工处理" "节点保持不可调度, 不会再次自动重启。"$'\n'"$(bullets "$FAULTS")"
+}
+
+handle_failed() {
+  if check_gpus; then
+    log INFO "failed 状态下检测到GPU已恢复(可能已人工修复)"
+    finish_recovery
+  else
+    log WARN "节点处于 failed 状态, 故障仍存在, 等待人工处理: $(head -n1 <<<"$FAULTS" | cut -c1-200)"
+    if [ $(( $(date +%s) - LAST_REMIND )) -ge "$NOTIFY_REMIND_INTERVAL" ]; then
+      LAST_REMIND=$(date +%s)
+      notify failed_reminder critical "节点仍处于故障待人工处理状态" "$(bullets "$FAULTS")"
+    fi
+  fi
+}
+
+########################## 主循环 ##########################
+main() {
+  log INFO "gpu-guard v$VERSION 启动: interval=${CHECK_INTERVAL}s action=$ACTION expected_gpus=$EXPECTED_GPU_COUNT fatal_xids=[$FATAL_XIDS] max_concurrent=$MAX_CONCURRENT"
+  local chans=""
+  [ -n "$NOTIFY_DINGTALK_URL" ] && chans+="dingtalk "
+  [ -n "$NOTIFY_FEISHU_URL" ]   && chans+="feishu "
+  [ -n "$NOTIFY_WEBHOOK_URL" ]  && chans+="webhook "
+  log INFO "通知渠道: ${chans:-无}"
+  start_metrics_server
+  local state ok_n=0
+  while :; do
+    state=$(get_state)
+    METRIC_STATE="$state"
+    case "$state" in
+      unknown)
+        log WARN "无法读取节点状态(API不可用?), 稍后重试" ;;
+      healthy|"")
+        if check_gpus; then
+          FAULT_EPISODE=0
+          ok_n=$((ok_n+1))
+          [ $(( (ok_n-1) % HEALTH_LOG_EVERY )) -eq 0 ] && log INFO "GPU健康检查通过: $(grep -c . <<<"$CUR_GPUS") 张卡正常"
+        else
+          process_fault 0
+        fi ;;
+      draining)   process_fault 1 ;;
+      rebooting)  handle_rebooting ;;
+      recovering) recover ;;
+      failed)     handle_failed ;;
+      *)          log WARN "未知状态 '$state', 忽略" ;;
+    esac
+    write_metrics
+    sleep "$CHECK_INTERVAL"
+  done
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  case "${1:-}" in
+    --http) serve_http ;;
+    *)      main ;;
+  esac
+fi

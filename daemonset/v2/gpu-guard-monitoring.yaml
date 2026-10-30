@@ -1,0 +1,72 @@
+# 需要集群已安装 Prometheus Operator (kube-prometheus-stack 等).
+# 若你的 Prometheus 通过 label 选择 PodMonitor/PrometheusRule(如 release: kube-prometheus-stack),
+# 请在两个资源的 metadata.labels 中补上对应标签.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: gpu-guard
+  namespace: kube-system
+  labels:
+    app: gpu-guard
+spec:
+  selector:
+    matchLabels:
+      app: gpu-guard
+  namespaceSelector:
+    matchNames: [kube-system]
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: gpu-guard
+  namespace: kube-system
+  labels:
+    app: gpu-guard
+spec:
+  groups:
+    - name: gpu-guard
+      rules:
+        - alert: GPUGuardGPUFault
+          expr: gpu_guard_gpu_fault == 1
+          labels: {severity: critical}
+          annotations:
+            summary: "GPU 故障: {{ $labels.node }} GPU{{ $labels.gpu }} ({{ $labels.type }})"
+            description: "uuid={{ $labels.uuid }} pci={{ $labels.pci }}"
+        - alert: GPUGuardNodeFailed
+          expr: gpu_guard_node_state{state="failed"} == 1
+          for: 5m
+          labels: {severity: critical}
+          annotations:
+            summary: "节点 {{ $labels.node }} GPU 自动处置失败, 需人工介入(节点保持不可调度)"
+        - alert: GPUGuardNodeStuck
+          expr: gpu_guard_node_state{state=~"draining|rebooting|recovering"} == 1
+          for: 1h
+          labels: {severity: warning}
+          annotations:
+            summary: "节点 {{ $labels.node }} 处置流程超过 1 小时仍在 {{ $labels.state }} (排水被 PDB 阻塞? 主机未恢复?)"
+        - alert: GPUGuardFlapping
+          expr: increase(gpu_guard_fault_events_total[24h]) >= 3
+          labels: {severity: warning}
+          annotations:
+            summary: "节点 {{ $labels.node }} 24 小时内 GPU 故障 {{ $value }} 次, 建议报修/换卡"
+        - alert: GPUGuardMetricsStale
+          expr: time() - gpu_guard_last_update_timestamp_seconds > 600
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: "节点 {{ $labels.node }} 的 gpu-guard 指标超过 10 分钟未刷新(守护进程卡死?)"
+        - alert: GPUGuardNotifyFailing
+          expr: increase(gpu_guard_notifications_total{result="fail"}[15m]) > 0
+          labels: {severity: warning}
+          annotations:
+            summary: "gpu-guard 通知渠道 {{ $labels.channel }} 发送失败, 请检查 webhook 配置"
+        - alert: GPUGuardDown
+          expr: up{job=~".*gpu-guard.*"} == 0
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: "gpu-guard 指标端点不可达: {{ $labels.instance }}"

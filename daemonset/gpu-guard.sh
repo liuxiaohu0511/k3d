@@ -1,0 +1,330 @@
+#!/usr/bin/env bash
+# gpu-guard: NVIDIA GPU 故障自动处置
+# 流程: 检测 -> 记录故障 -> cordon -> drain(等待排空) -> 重启/关机 -> 开机后复检 -> uncordon
+# 状态保存在 Node 的 label/annotation 中, Pod 随主机重启后可从断点继续.
+set -uo pipefail
+
+########################## 配置(均可通过环境变量覆盖) ##########################
+NODE_NAME="${NODE_NAME:?NODE_NAME 未设置}"
+CHECK_INTERVAL="${CHECK_INTERVAL:-60}"              # 巡检间隔(秒)
+ACTION="${ACTION:-reboot}"                          # reboot | poweroff
+EXPECTED_GPU_COUNT="${EXPECTED_GPU_COUNT:-0}"       # 期望卡数, 0=不检查(仍会与历史已知卡对比)
+SMI_TIMEOUT="${SMI_TIMEOUT:-30}"                    # nvidia-smi 超时(秒)
+FATAL_XIDS="${FATAL_XIDS:-48 62 64 74 79 95 119 120 140}"   # 视为致命的 Xid
+DRAIN_ATTEMPT_TIMEOUT="${DRAIN_ATTEMPT_TIMEOUT:-300}"       # 单次 kubectl drain 超时
+DRAIN_TOTAL_TIMEOUT="${DRAIN_TOTAL_TIMEOUT:-3600}"          # 排水总等待上限
+FORCE_AFTER_DRAIN_TIMEOUT="${FORCE_AFTER_DRAIN_TIMEOUT:-false}"  # 排水超时是否仍强制关机
+RECOVER_WAIT="${RECOVER_WAIT:-900}"                 # 开机后等待GPU恢复的最长时间(秒)
+REBOOT_WAIT_RETRY="${REBOOT_WAIT_RETRY:-600}"       # 发出重启命令后多久仍未重启则重发
+FLAP_WINDOW="${FLAP_WINDOW:-3600}"                  # 恢复后该时间内再次故障 => 不再自动重启, 转人工
+MAX_CONCURRENT="${MAX_CONCURRENT:-1}"               # 集群内同时处理的节点数上限(防误判雪崩)
+HEALTH_LOG_EVERY="${HEALTH_LOG_EVERY:-30}"          # 健康时每N次巡检打一条日志
+DATA_DIR="${DATA_DIR:-/data}"
+# 在宿主机命名空间执行命令(需 privileged + hostPID); 测试时可置空
+HOST_EXEC="${HOST_EXEC-nsenter -t 1 -m -u -i -n -p --}"
+
+LOG_FILE="$DATA_DIR/gpu-guard.log"
+KNOWN_FILE="$DATA_DIR/known-gpus"
+LABEL_STATE="gpu-guard.k8s.io/state"   # healthy|draining|rebooting|recovering|failed
+ANN="gpu-guard.k8s.io"
+FATAL_RE="$(echo $FATAL_XIDS | tr ' ' '|')"
+
+mkdir -p "$DATA_DIR" 2>/dev/null || true
+
+########################## 日志 ##########################
+log() {
+  local lvl="$1"; shift
+  local line
+  line="$(date '+%F %T%z') [$lvl] [$NODE_NAME] $*"
+  echo "$line"
+  if [ -f "$LOG_FILE" ] && [ "$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)" -gt 52428800 ]; then
+    mv -f "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null || true
+  fi
+  echo "$line" >> "$LOG_FILE" 2>/dev/null || true
+}
+log_lines() { # log_lines LEVEL "多行文本"
+  local lvl="$1" l
+  while IFS= read -r l; do [ -n "$l" ] && log "$lvl" "$l"; done <<<"$2"
+}
+trim() { local s="$*"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+
+########################## Node 状态读写 ##########################
+get_state() {
+  local j
+  j=$(kubectl get node "$NODE_NAME" -o json 2>/dev/null) || { echo unknown; return; }
+  jq -r --arg k "$LABEL_STATE" '.metadata.labels[$k] // "healthy"' <<<"$j"
+}
+set_state() { kubectl label node "$NODE_NAME" --overwrite "$LABEL_STATE=$1" >/dev/null 2>&1 && log INFO "节点状态 -> $1"; }
+get_ann()   { kubectl get node "$NODE_NAME" -o json 2>/dev/null | jq -r --arg k "$ANN/$1" '.metadata.annotations[$k] // ""'; }
+set_ann()   { kubectl annotate node "$NODE_NAME" --overwrite "$ANN/$1=$2" >/dev/null 2>&1; }
+del_ann()   { kubectl annotate node "$NODE_NAME" "$ANN/$1-" >/dev/null 2>&1 || true; }
+host_boot_id() { $HOST_EXEC cat /proc/sys/kernel/random/boot_id 2>/dev/null | tr -d '[:space:]'; }
+
+########################## GPU 检查 ##########################
+CUR_GPUS=""   # 每行: pci|index|uuid|name
+FAULTS=""     # 每行一条故障描述
+
+check_gpus() {
+  FAULTS=""; CUR_GPUS=""
+  local out rc
+  out=$(timeout "$SMI_TIMEOUT" $HOST_EXEC nvidia-smi \
+        --query-gpu=index,uuid,pci.bus_id,name --format=csv,noheader 2>&1); rc=$?
+  if [ $rc -ne 0 ]; then
+    FAULTS+="nvidia-smi 执行失败(rc=$rc), 可能掉卡/驱动异常/超时: $(tr '\n' ' ' <<<"$out" | cut -c1-400)"$'\n'
+    [ -s "$KNOWN_FILE" ] && FAULTS+="本机已知GPU(可能受影响): $(tr '\n' ';' <"$KNOWN_FILE")"$'\n'
+    return 1
+  fi
+
+  local idx uuid pci name
+  while IFS=',' read -r idx uuid pci name; do
+    [ -z "$(trim "$idx")" ] && continue
+    pci="$(trim "$pci")"
+    CUR_GPUS+="${pci,,}|$(trim "$idx")|$(trim "$uuid")|$(trim "$name")"$'\n'
+  done <<<"$out"
+  local n; n=$(grep -c . <<<"$CUR_GPUS")
+
+  # 1) 与历史已知卡对比(以PCI槽位为键, 换卡后同槽位不受影响)
+  if [ -s "$KNOWN_FILE" ]; then
+    local kpci kidx kuuid kname
+    while IFS='|' read -r kpci kidx kuuid kname; do
+      [ -z "$kpci" ] && continue
+      grep -qiF "$kpci|" <<<"$CUR_GPUS" || \
+        FAULTS+="GPU$kidx 丢失(掉卡): pci=$kpci uuid=$kuuid name=$kname"$'\n'
+    done <"$KNOWN_FILE"
+  fi
+  if [ "$EXPECTED_GPU_COUNT" -gt 0 ] && [ "$n" -lt "$EXPECTED_GPU_COUNT" ] && [ -z "$FAULTS" ]; then
+    FAULTS+="GPU数量不足: 当前 $n, 期望 $EXPECTED_GPU_COUNT"$'\n'
+  fi
+
+  # 2) ECC / 页面退役 / 行重映射(字段不被支持时仅告警, 不判故障)
+  local ext erc
+  ext=$(timeout "$SMI_TIMEOUT" $HOST_EXEC nvidia-smi \
+        --query-gpu=index,uuid,pci.bus_id,ecc.errors.uncorrected.volatile.total,retired_pages.pending,remapped_rows.failure,remapped_rows.pending \
+        --format=csv,noheader,nounits 2>&1); erc=$?
+  if [ $erc -eq 0 ]; then
+    local ecc rp rf rpend
+    while IFS=',' read -r idx uuid pci ecc rp rf rpend; do
+      idx=$(trim "$idx"); [ -z "$idx" ] && continue
+      uuid=$(trim "$uuid"); pci=$(trim "$pci"); ecc=$(trim "$ecc")
+      rp=$(trim "$rp"); rf=$(trim "$rf"); rpend=$(trim "$rpend")
+      [[ "$ecc" =~ ^[0-9]+$ ]] && [ "$ecc" -gt 0 ] && \
+        FAULTS+="GPU$idx ($uuid, $pci) 存在不可纠正ECC错误(volatile): $ecc"$'\n'
+      [ "${rp,,}" = "yes" ] && \
+        FAULTS+="GPU$idx ($uuid, $pci) 有待处理的显存页面退役(需重置/重启)"$'\n'
+      [[ "$rf" =~ ^[0-9]+$ ]] && [ "$rf" -gt 0 ] && \
+        FAULTS+="GPU$idx ($uuid, $pci) 显存行重映射失败(remapped_rows.failure=$rf), 建议更换"$'\n'
+      [ "${rpend,,}" = "yes" ] && \
+        FAULTS+="GPU$idx ($uuid, $pci) 显存行重映射待重置(remapped_rows.pending)"$'\n'
+    done <<<"$ext"
+  else
+    log WARN "扩展指标(ECC/重映射)查询失败, 仅使用基础检查: $(tr '\n' ' ' <<<"$ext" | cut -c1-200)"
+  fi
+
+  # 3) 内核日志中的致命 Xid
+  local xl l xpci gl gidx
+  xl=$($HOST_EXEC dmesg 2>/dev/null | grep -E "NVRM: Xid \([^)]*\): ($FATAL_RE)[ ,:]" | tail -n 10)
+  if [ -n "$xl" ]; then
+    while IFS= read -r l; do
+      xpci=$(sed -E 's/.*Xid \((PCI:)?([^)]*)\).*/\2/' <<<"$l")
+      gl=$(grep -iF "${xpci#0000:}" <<<"$CUR_GPUS" | head -n1)
+      gidx=$(cut -d'|' -f2 <<<"$gl")
+      FAULTS+="致命Xid: GPU${gidx:-?} pci=$xpci | $(cut -c1-300 <<<"$l")"$'\n'
+    done <<<"$xl"
+  fi
+
+  if [ -z "$FAULTS" ]; then
+    printf '%s' "$CUR_GPUS" > "$KNOWN_FILE" 2>/dev/null || true
+    return 0
+  fi
+  FAULTS="$(sort -u <<<"$FAULTS")"$'\n'
+  return 1
+}
+
+record_fault() {
+  set_ann fault-time "$(date -Is)"
+  set_ann fault-detail "$(tr '\n' ';' <<<"$FAULTS" | cut -c1-2000)"
+}
+
+########################## cordon / drain / shutdown ##########################
+cordon_node() {
+  log STEP "[2/6] 设置节点不可调度(cordon)"
+  local unsched
+  unsched=$(kubectl get node "$NODE_NAME" -o jsonpath='{.spec.unschedulable}' 2>/dev/null)
+  # 仅当节点原本可调度时才记录"由本程序cordon", 避免恢复时误解除管理员手动cordon
+  [ "$unsched" != "true" ] && set_ann cordoned-by-guard true
+  if kubectl cordon "$NODE_NAME" >/dev/null 2>&1; then
+    log OK "[2/6] 节点已不可调度"
+  else
+    log ERROR "[2/6] cordon 失败, 下次巡检重试"; return 1
+  fi
+}
+
+remaining_pods() { # 输出仍在节点上的非DaemonSet/非静态Pod; API失败返回非0
+  local j
+  j=$(kubectl get pods -A --field-selector "spec.nodeName=$NODE_NAME" -o json 2>/dev/null) || return 1
+  jq -r '.items[]
+    | select(.status.phase!="Succeeded" and .status.phase!="Failed")
+    | select(((.metadata.ownerReferences // []) | map(.kind=="DaemonSet") | any) | not)
+    | select((.metadata.annotations // {})["kubernetes.io/config.mirror"] == null)
+    | "\(.metadata.namespace)/\(.metadata.name)"' <<<"$j"
+}
+
+drain_node() {
+  local deadline=$(( $(date +%s) + DRAIN_TOTAL_TIMEOUT )) n=0 out rem
+  while :; do
+    n=$((n+1))
+    log STEP "[3/6] 第${n}次排水(kubectl drain), 单次超时 ${DRAIN_ATTEMPT_TIMEOUT}s"
+    out=$(kubectl drain "$NODE_NAME" --ignore-daemonsets --delete-emptydir-data --force \
+          --timeout="${DRAIN_ATTEMPT_TIMEOUT}s" 2>&1)
+    log_lines INFO "drain: $(tail -n 20 <<<"$out")"
+    if rem=$(remaining_pods); then
+      if [ -z "$rem" ]; then log OK "[3/6] 排水完成, 节点上已无业务Pod"; return 0; fi
+      log WARN "[3/6] 仍有 $(grep -c . <<<"$rem") 个Pod未驱逐: $(tr '\n' ' ' <<<"$rem" | cut -c1-400)"
+    else
+      log WARN "[3/6] 查询节点Pod失败(API不可用?)"
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      if [ "$FORCE_AFTER_DRAIN_TIMEOUT" = "true" ]; then
+        log WARN "[3/6] 排水超时 ${DRAIN_TOTAL_TIMEOUT}s, FORCE_AFTER_DRAIN_TIMEOUT=true, 强制继续"
+        return 0
+      fi
+      log ERROR "[3/6] 排水超时 ${DRAIN_TOTAL_TIMEOUT}s, 未排空, 不执行关机(可能被PDB阻塞), 稍后重试"
+      set_ann drain-blocked "$(date -Is)"
+      return 1
+    fi
+    sleep 15
+  done
+}
+
+shutdown_host() {
+  local bid; bid=$(host_boot_id)
+  if [ -z "$bid" ] || ! set_ann boot-id "$bid" || ! set_ann rebooting-at "$(date +%s)"; then
+    log ERROR "[4/6] 记录 boot-id 失败, 取消本次关机, 稍后重试"; return 1
+  fi
+  del_ann drain-blocked
+  set_state rebooting
+  log STEP "[4/6] 排空完成, 执行 ${ACTION} (boot_id=$bid)"
+  $HOST_EXEC sync
+  case "$ACTION" in
+    poweroff) $HOST_EXEC systemctl poweroff ;;
+    *)        $HOST_EXEC systemctl reboot ;;
+  esac
+  log INFO "[4/6] ${ACTION} 命令已下发, 等待主机下线..."
+}
+
+########################## 故障处置主流程 ##########################
+process_fault() { # $1=0 新故障, 1=恢复上次进度
+  if [ "$1" = "0" ]; then
+    log STEP "[1/6] 检测到GPU故障, 开始记录详情"
+    log_lines FAULT "$FAULTS"
+    record_fault
+
+    local last others
+    last=$(get_ann last-recovered)
+    if [ -n "$last" ] && [ $(( $(date +%s) - last )) -lt "$FLAP_WINDOW" ]; then
+      log ERROR "距上次恢复不足 ${FLAP_WINDOW}s 再次故障, 疑似反复故障, 不再自动重启, 仅cordon并转人工"
+      cordon_node; set_state failed; return
+    fi
+    others=$(kubectl get nodes -l "$LABEL_STATE in (draining,rebooting,recovering)" -o name 2>/dev/null \
+             | grep -vx "node/$NODE_NAME" | grep -c .)
+    if [ "${others:-0}" -ge "$MAX_CONCURRENT" ]; then
+      log WARN "已有 $others 个节点在处理中(上限 $MAX_CONCURRENT), 本节点排队, 下次巡检再试"
+      return
+    fi
+    set_state draining || return
+  else
+    log INFO "继续上次未完成的处置流程(状态: draining)"
+  fi
+  cordon_node || return
+  drain_node  || return
+  shutdown_host
+}
+
+handle_rebooting() {
+  local cur old age
+  cur=$(host_boot_id); old=$(get_ann boot-id)
+  if [ -z "$old" ] || { [ -n "$cur" ] && [ "$cur" != "$old" ]; }; then
+    recover; return
+  fi
+  age=$(( $(date +%s) - $(get_ann rebooting-at | grep -E '^[0-9]+$' || echo "$(date +%s)") ))
+  if [ "$age" -gt "$REBOOT_WAIT_RETRY" ]; then
+    log WARN "[4/6] 已过 ${age}s 主机仍未重启, 重新下发 ${ACTION}"
+    shutdown_host
+  else
+    log INFO "[4/6] 等待主机重启中(${age}s)"
+  fi
+}
+
+finish_recovery() {
+  log STEP "[6/6] GPU复检通过: $(grep -c . <<<"$CUR_GPUS") 张卡正常"
+  if [ "$(get_ann cordoned-by-guard)" = "true" ]; then
+    if kubectl uncordon "$NODE_NAME" >/dev/null 2>&1; then
+      log OK "[6/6] 节点已恢复可调度(uncordon)"
+    else
+      log ERROR "[6/6] uncordon 失败, 下次巡检重试"; return 1
+    fi
+  else
+    log INFO "[6/6] 节点并非由本程序cordon, 保持原状态不解除"
+  fi
+  for k in fault-time fault-detail boot-id rebooting-at cordoned-by-guard drain-blocked; do del_ann "$k"; done
+  set_ann last-recovered "$(date +%s)"
+  set_state healthy
+}
+
+recover() {
+  set_state recovering
+  log STEP "[5/6] 主机已重启(boot_id 已变化), 开始复检GPU, 最长等待 ${RECOVER_WAIT}s"
+  local deadline=$(( $(date +%s) + RECOVER_WAIT ))
+  while :; do
+    if check_gpus; then finish_recovery; return; fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then break; fi
+    log WARN "[5/6] 复检未通过, 15s后重试: $(head -n1 <<<"$FAULTS" | cut -c1-200)"
+    sleep 15
+  done
+  log ERROR "[5/6] 重启后GPU仍有故障, 节点保持不可调度, 需人工处理(不会再次自动重启)"
+  log_lines FAULT "$FAULTS"
+  record_fault
+  set_state failed
+}
+
+handle_failed() {
+  if check_gpus; then
+    log INFO "failed 状态下检测到GPU已恢复(可能已人工修复)"
+    finish_recovery
+  else
+    FAILED_N=$((FAILED_N+1))
+    if [ $((FAILED_N % 10)) -eq 1 ]; then
+      log ERROR "节点处于 failed 状态, 故障仍存在, 等待人工处理:"
+      log_lines FAULT "$FAULTS"
+    fi
+  fi
+}
+
+########################## 主循环 ##########################
+main() {
+  log INFO "gpu-guard 启动: interval=${CHECK_INTERVAL}s action=$ACTION expected_gpus=$EXPECTED_GPU_COUNT fatal_xids=[$FATAL_XIDS] max_concurrent=$MAX_CONCURRENT"
+  local state ok_n=0
+  FAILED_N=0
+  while :; do
+    state=$(get_state)
+    case "$state" in
+      unknown)
+        log WARN "无法读取节点状态(API不可用?), 稍后重试" ;;
+      healthy|"")
+        if check_gpus; then
+          ok_n=$((ok_n+1))
+          [ $(( (ok_n-1) % HEALTH_LOG_EVERY )) -eq 0 ] && log INFO "GPU健康检查通过: $(grep -c . <<<"$CUR_GPUS") 张卡正常"
+        else
+          process_fault 0
+        fi ;;
+      draining)   process_fault 1 ;;
+      rebooting)  handle_rebooting ;;
+      recovering) recover ;;
+      failed)     handle_failed ;;
+      *)          log WARN "未知状态 '$state', 忽略" ;;
+    esac
+    sleep "$CHECK_INTERVAL"
+  done
+}
+
+[[ "${BASH_SOURCE[0]}" == "$0" ]] && main
